@@ -17,6 +17,13 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.calibration import calibration_curve
 from sklearn.preprocessing import StandardScaler
 
+try:
+    import shap
+    SHAP_AVAILABLE = True
+except ImportError:
+    SHAP_AVAILABLE = False
+    logger.warning("SHAP not installed, explanations disabled")
+
 from yc_analyzer.config import settings
 from yc_analyzer.data.database import Database, get_db
 from yc_analyzer.models.labeling import get_labeled_training_data, get_holdout_data
@@ -1019,8 +1026,57 @@ def run_training_pipeline(db: Optional[Database] = None) -> Dict[str, Any]:
     with open(model_dir / "metrics.json", "w") as f:
         json.dump(all_metrics, f, indent=2, default=str)
 
+    # P1.5: SHAP explanations
+    if SHAP_AVAILABLE:
+        try:
+            compute_shap_values(lgb_model, X_test, feature_names, "lightgbm", model_dir)
+            compute_shap_values(xgb_model, X_test, feature_names, "xgboost", model_dir)
+            compute_shap_values(lr_model, X_test, feature_names, "logistic_regression", model_dir, scaler=lr_scaler)
+        except Exception as e:
+            logger.warning(f"SHAP computation failed: {e}")
+
     logger.info(f"Models and metrics saved to {model_dir}")
     return all_metrics
+
+
+def compute_shap_values(model: Any, X: np.ndarray, feature_names: List[str], model_name: str, model_dir: Path, scaler: Any = None) -> None:
+    """Compute and save SHAP values for a trained model."""
+    if not SHAP_AVAILABLE:
+        return
+    
+    logger.info(f"Computing SHAP values for {model_name}...")
+    
+    try:
+        if model_name in ("xgboost", "lightgbm"):
+            explainer = shap.TreeExplainer(model)
+            shap_values = explainer.shap_values(X)
+            if isinstance(shap_values, list):
+                shap_values = shap_values[1]  # positive class for binary
+        else:
+            # Linear model
+            if scaler is not None:
+                X_scaled = scaler.transform(X)
+            else:
+                X_scaled = X
+            explainer = shap.LinearExplainer(model, X_scaled)
+            shap_values = explainer.shap_values(X_scaled)
+        
+        # Save SHAP values
+        np.savez_compressed(model_dir / f"shap_values_{model_name}.npz", 
+                           shap_values=shap_values, X=X)
+        
+        # Compute mean absolute SHAP for feature importance
+        mean_abs_shap = np.mean(np.abs(shap_values), axis=0)
+        shap_importance = dict(zip(feature_names, mean_abs_shap.tolist()))
+        shap_importance_sorted = dict(sorted(shap_importance.items(), key=lambda x: x[1], reverse=True))
+        
+        with open(model_dir / f"shap_importance_{model_name}.json", "w") as f:
+            json.dump(shap_importance_sorted, f, indent=2)
+        
+        logger.info(f"SHAP values saved for {model_name}")
+        
+    except Exception as e:
+        logger.warning(f"SHAP computation failed for {model_name}: {e}")
 
 
 def _pseudo_label(

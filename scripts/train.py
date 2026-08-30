@@ -25,6 +25,10 @@ def main():
         "--trials", type=int, default=50,
         help="Number of Optuna trials per model when using --tune (default: 50)",
     )
+    parser.add_argument(
+        "--shap", action="store_true",
+        help="Compute SHAP explanations after training (requires shap package)",
+    )
     args = parser.parse_args()
 
     print("=" * 60)

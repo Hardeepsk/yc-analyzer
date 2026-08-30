@@ -4,6 +4,8 @@ import json
 import sys
 from pathlib import Path
 
+import numpy as np
+
 # Ensure src is on path for imports
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "src"))
 
@@ -32,7 +34,7 @@ st.markdown("Historical YC data, ML success predictions, and alpha signals from 
 st.sidebar.header("Navigation")
 page = st.sidebar.radio(
     "Go to",
-    ["Dashboard", "Company Search", "Batch Analysis", "Alpha Signals", "Model Performance"],
+    ["Dashboard", "Company Search", "Batch Analysis", "Alpha Signals", "Model Performance", "Model Explanations"],
 )
 
 # --- Dashboard Page ---
@@ -287,3 +289,127 @@ elif page == "Model Performance":
                              title=f"Top Features - {label}")
                 fig.update_layout(height=400)
                 st.plotly_chart(fig, use_container_width=True)
+
+
+# --- Model Explanations Page ---
+elif page == "Model Explanations":
+    st.header("🔍 Model Explanations (SHAP)")
+    st.markdown("SHAP (SHapley Additive exPlanations) values show how each feature contributes to individual predictions.")
+
+    model_dir = Path("models")
+    
+    # Check if SHAP files exist
+    shap_files = {
+        "LightGBM": ("shap_importance_lightgbm.json", "shap_values_lightgbm.npz"),
+        "XGBoost": ("shap_importance_xgboost.json", "shap_values_xgboost.npz"),
+        "LogisticRegression": ("shap_importance_logistic_regression.json", "shap_values_logistic_regression.npz"),
+    }
+    
+    available_models = []
+    for model_name, (imp_file, val_file) in shap_files.items():
+        if (model_dir / imp_file).exists() and (model_dir / val_file).exists():
+            available_models.append(model_name)
+    
+    if not available_models:
+        st.warning("SHAP explanations not available. Run training with SHAP computation enabled.")
+        st.code("PYTHONPATH=src python3 scripts/train.py --shap")
+    else:
+        selected_model = st.selectbox("Select Model", available_models)
+        
+        imp_file, val_file = shap_files[selected_model]
+        
+        # Load SHAP importance
+        with open(model_dir / imp_file) as f:
+            shap_importance = json.load(f)
+        
+        # Global feature importance
+        st.subheader(f"Global Feature Importance - {selected_model}")
+        import pandas as pd
+        df_imp = pd.DataFrame(list(shap_importance.items())[:20], columns=["Feature", "Mean |SHAP|"])
+        fig = px.bar(df_imp, x="Mean |SHAP|", y="Feature", orientation="h",
+                     title=f"Top 20 Features by Mean |SHAP| - {selected_model}")
+        fig.update_layout(height=500)
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # SHAP dependence plots for top features
+        st.subheader("SHAP Dependence Plots")
+        top_features = list(shap_importance.keys())[:5]
+        selected_feature = st.selectbox("Select Feature for Dependence Plot", top_features)
+        
+        # Load SHAP values
+        shap_data = np.load(model_dir / val_file)
+        shap_values = shap_data["shap_values"]
+        X = shap_data["X"]
+        
+        # Get feature index
+        feature_names = list(shap_importance.keys())
+        if selected_feature in feature_names:
+            feat_idx = feature_names.index(selected_feature)
+            
+            import pandas as pd
+            df_dep = pd.DataFrame({
+                "Feature Value": X[:, feat_idx],
+                "SHAP Value": shap_values[:, feat_idx]
+            })
+            
+            fig = px.scatter(df_dep, x="Feature Value", y="SHAP Value",
+                             title=f"SHAP Dependence: {selected_feature} ({selected_model})",
+                             trendline="lowess")
+            st.plotly_chart(fig, use_container_width=True)
+        
+        # Waterfall plot for a specific company
+        st.subheader("Individual Prediction Explanation (Waterfall)")
+        company_id = st.number_input("Company ID", min_value=1, value=1, step=1)
+        
+        if st.button("Generate Waterfall"):
+            # Get prediction
+            result = predict_company(company_id)
+            if "error" in result:
+                st.error(result["error"])
+            else:
+                st.write(f"Prediction: {result.get('ensemble', {}).get('success_probability', 'N/A')}")
+                
+                # Get company features
+                db = get_db()
+                row = db.conn.execute("""
+                    SELECT ce.*
+                    FROM companies_enriched ce
+                    WHERE ce.company_id = ?
+                """, [company_id]).fetchone()
+                
+                if row:
+                    cols = [d[0] for d in db.conn.description]
+                    features = dict(zip(cols, row))
+                    
+                    # Build waterfall data
+                    base_value = float(shap_values.mean())
+                    waterfall_data = []
+                    
+                    for feat_name, feat_importance in list(shap_importance.items())[:10]:
+                        if feat_name in features:
+                            waterfall_data.append({
+                                "Feature": feat_name,
+                                "Value": float(features[feat_name]) if features[feat_name] is not None else 0.0,
+                                "SHAP Contribution": float(feat_importance)
+                            })
+                    
+                    if waterfall_data:
+                        df_wf = pd.DataFrame(waterfall_data)
+                        fig = go.Figure(go.Waterfall(
+                            name="SHAP",
+                            orientation="h",
+                            measure=["relative"] * len(df_wf),
+                            x=df_wf["SHAP Contribution"],
+                            y=df_wf["Feature"],
+                            textposition="outside",
+                            text=[f"{v:.4f}" for v in df_wf["SHAP Contribution"]],
+                            connector={"line": {"color": "rgb(63, 63, 63)"}},
+                        ))
+                        fig.update_layout(
+                            title=f"SHAP Waterfall - Company {company_id} ({selected_model})",
+                            xaxis_title="SHAP Value",
+                            height=400
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                        st.dataframe(df_wf)

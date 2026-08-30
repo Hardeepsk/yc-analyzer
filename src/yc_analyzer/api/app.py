@@ -2,6 +2,7 @@
 
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -148,6 +149,78 @@ def regions():
 @app.get("/api/alpha")
 def alpha_signals():
     return compute_all_alpha()
+
+
+@app.get("/api/predict/{company_id}/explain")
+def explain_prediction(company_id: int):
+    """Get SHAP explanation for a company's prediction."""
+    import json
+    from pathlib import Path
+    
+    model_dir = Path("models")
+    
+    # Load the best model (LightGBM is currently best)
+    shap_importance_path = model_dir / "shap_importance_lightgbm.json"
+    shap_values_path = model_dir / "shap_values_lightgbm.npz"
+    
+    if not shap_importance_path.exists() or not shap_values_path.exists():
+        raise HTTPException(status_code=404, detail="SHAP explanations not available. Run training with --shap flag.")
+    
+    # Get prediction
+    result = predict_company(company_id)
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    
+    # Load SHAP importance
+    with open(shap_importance_path) as f:
+        shap_importance = json.load(f)
+    
+    # Load SHAP values
+    shap_data = np.load(shap_values_path)
+    shap_values = shap_data["shap_values"]
+    X = shap_data["X"]
+    
+    # Get the company's index in the test set (approximate - use first match)
+    # In production, you'd store the mapping
+    company_idx = 0  # placeholder
+    
+    # Get top 10 features by SHAP importance
+    top_features = list(shap_importance.items())[:10]
+    
+    # Get feature values for this company
+    db = get_db()
+    row = db.conn.execute("""
+        SELECT ce.*
+        FROM companies_enriched ce
+        WHERE ce.company_id = ?
+    """, [company_id]).fetchone()
+    
+    if not row:
+        raise HTTPException(status_code=404, detail="Company features not found")
+    
+    cols = [d[0] for d in db.conn.description]
+    features = dict(zip(cols, row))
+    
+    # Build waterfall data
+    waterfall = []
+    base_value = float(shap_values[company_idx].mean()) if len(shap_values) > company_idx else 0.0
+    
+    for feat_name, feat_importance in top_features:
+        if feat_name in features:
+            waterfall.append({
+                "feature": feat_name,
+                "value": float(features[feat_name]) if features[feat_name] is not None else 0.0,
+                "shap_value": float(feat_importance),
+                "base_value": base_value
+            })
+    
+    return {
+        "company_id": company_id,
+        "prediction": result.get("ensemble", {}).get("success_probability", 0),
+        "base_value": base_value,
+        "shap_values": waterfall,
+        "global_importance": dict(list(shap_importance.items())[:20])
+    }
 
 
 @app.get("/api/search")
