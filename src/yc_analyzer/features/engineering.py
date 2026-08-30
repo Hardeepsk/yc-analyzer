@@ -331,6 +331,8 @@ class FeatureEngineer:
         batch_features = self._build_batch_features(companies_df)
         market_features = self._build_market_features(companies_df)
         funding_features = self._build_funding_features(companies_df)
+        industry_batch_features = self._build_industry_batch_features(companies_df)
+        timing_features = self._build_timing_features(companies_df)
 
         # Combine all features
         all_features = self._combine_features(
@@ -339,7 +341,9 @@ class FeatureEngineer:
             company_features,
             batch_features,
             market_features,
-            funding_features
+            funding_features,
+            industry_batch_features,
+            timing_features
         )
 
         # Store in database
@@ -615,6 +619,113 @@ class FeatureEngineer:
 
         return features
 
+    def _build_industry_batch_features(self, companies_df: pl.DataFrame) -> pl.DataFrame:
+        """Build industry-batch interaction features (P5.2)."""
+        logger.info("Building industry-batch interaction features...")
+
+        # Parse batch to get year and season
+        companies_with_batch = companies_df.with_columns([
+            pl.col("batch").str.extract(r"(Winter|Spring|Summer|Fall)\s+(\d{4})", 1).alias("batch_season"),
+            pl.col("batch").str.extract(r"(Winter|Spring|Summer|Fall)\s+(\d{4})", 2).cast(pl.Int32).alias("batch_year"),
+        ])
+
+        # Industry × batch_year interaction (one-hot encoded top industries per year)
+        # Get top 20 industries by company count
+        top_industries = companies_df.filter(pl.col("industry").is_not_null()).group_by("industry").agg([
+            pl.len().alias("count")
+        ]).sort("count", descending=True).head(20)["industry"].to_list()
+
+        # Industry momentum: unicorn rate for this industry in last 3 batches
+        industry_batch_stats = companies_df.filter(
+            pl.col("industry").is_not_null() & pl.col("top_company").fill_null(False)
+        ).group_by(["industry", "batch"]).agg([
+            pl.len().alias("unicorn_count"),
+        ]).sort(["industry", "batch"])
+
+        # Compute rolling 3-batch unicorn rate per industry
+        industry_momentum = {}
+        for industry in top_industries:
+            ind_data = industry_batch_stats.filter(pl.col("industry") == industry)
+            if len(ind_data) >= 3:
+                # Get last 3 batches
+                last_3 = ind_data.tail(3)
+                total_unicorns = last_3["unicorn_count"].sum()
+                industry_momentum[industry] = total_unicorns / 3.0
+            else:
+                industry_momentum[industry] = 0.0
+
+        # Industry × season interaction
+        industry_season_stats = companies_df.filter(
+            pl.col("industry").is_not_null() & pl.col("top_company").fill_null(False)
+        ).group_by(["industry", "batch_season"]).agg([
+            pl.len().alias("unicorn_count"),
+        ])
+        industry_season_rate = {}
+        for row in industry_season_stats.iter_rows(named=True):
+            key = (row["industry"], row["batch_season"])
+            industry_season_rate[key] = row["unicorn_count"]
+
+        # Build features
+        features = companies_with_batch.with_columns([
+            # Industry momentum (rolling 3-batch unicorn rate)
+            pl.col("industry").replace(industry_momentum, default=0.0).alias("industry_momentum"),
+            # Industry × season unicorn rate
+            pl.struct(["industry", "batch_season"]).map_elements(
+                lambda x: industry_season_rate.get((x["industry"], x["batch_season"]), 0),
+                return_dtype=pl.Int32
+            ).alias("industry_season_unicorn_rate"),
+            # Industry × batch_year (encoded as industry-specific year trend)
+            pl.col("industry").fill_null("unknown"),
+            pl.col("batch_year").fill_null(0),
+        ]).select([
+            "id",
+            "industry_momentum",
+            "industry_season_unicorn_rate",
+        ])
+
+        return features
+
+    def _build_timing_features(self, companies_df: pl.DataFrame) -> pl.DataFrame:
+        """Build company age and founding timing features (P5.6)."""
+        logger.info("Building company age and timing features...")
+
+        # Parse batch to get year and season
+        companies_with_batch = companies_df.with_columns([
+            pl.col("batch").str.extract(r"(Winter|Spring|Summer|Fall)\s+(\d{4})", 1).alias("batch_season"),
+            pl.col("batch").str.extract(r"(Winter|Spring|Summer|Fall)\s+(\d{4})", 2).cast(pl.Int32).alias("batch_year"),
+        ])
+
+        features = companies_with_batch.with_columns([
+            # Company age at batch (batch_year - year_founded)
+            (pl.col("batch_year").fill_null(0) - pl.col("year_founded").fill_null(0)).alias("age_at_batch"),
+            # Speed to YC: months from founding to batch (approximate)
+            # Assume Winter=Q1, Spring=Q2, Summer=Q3, Fall=Q4
+            pl.when(pl.col("batch_season") == "Winter").then(pl.col("batch_year") * 12 + 1)
+            .when(pl.col("batch_season") == "Spring").then(pl.col("batch_year") * 12 + 4)
+            .when(pl.col("batch_season") == "Summer").then(pl.col("batch_year") * 12 + 7)
+            .when(pl.col("batch_season") == "Fall").then(pl.col("batch_year") * 12 + 10)
+            .otherwise(pl.col("batch_year") * 12 + 1).alias("batch_month"),
+            pl.col("year_founded").fill_null(0).alias("year_founded"),
+        ]).with_columns([
+            # Months from founding to batch
+            (pl.col("batch_month") - pl.col("year_founded") * 12).alias("months_to_yc"),
+            # Binary: took >2 years to apply to YC
+            ((pl.col("batch_year").fill_null(0) - pl.col("year_founded").fill_null(0)) > 2).alias("slow_to_yc"),
+            # Binary: founded during recession (2008, 2020)
+            pl.col("year_founded").is_in([2008, 2009, 2020]).alias("founded_in_recession"),
+            # Binary: founded during AI boom (2022+)
+            (pl.col("year_founded").fill_null(0) >= 2022).alias("founded_in_ai_boom"),
+        ]).select([
+            "id",
+            "age_at_batch",
+            "months_to_yc",
+            "slow_to_yc",
+            "founded_in_recession",
+            "founded_in_ai_boom",
+        ])
+
+        return features
+
     def _build_interaction_features(self, combined_df: pl.DataFrame) -> pl.DataFrame:
         """Build feature interactions and polynomial features (P5.1)."""
         logger.info("Building interaction features...")
@@ -677,6 +788,8 @@ class FeatureEngineer:
         batch_features: pl.DataFrame,
         market_features: pl.DataFrame,
         funding_features: pl.DataFrame,
+        industry_batch_features: pl.DataFrame,
+        timing_features: pl.DataFrame,
     ) -> pl.DataFrame:
         """Combine all feature sets."""
         logger.info("Combining features...")
@@ -685,7 +798,7 @@ class FeatureEngineer:
         result = companies_df.select(["id"])
 
         # Join all feature sets
-        for feat_df in [founder_features, company_features, batch_features, market_features, funding_features]:
+        for feat_df in [founder_features, company_features, batch_features, market_features, funding_features, industry_batch_features, timing_features]:
             result = result.join(feat_df, on="id", how="left")
 
         # Add interaction features

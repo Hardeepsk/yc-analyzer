@@ -79,6 +79,10 @@ FEATURE_COLS = [
     # P1.1: Funding features
     "has_funding_data", "total_raised_usd", "last_valuation_usd",
     "round_count", "funding_stage_encoded", "years_since_last_round", "investor_quality_score",
+    # P5.2: Industry-batch interaction features
+    "industry_momentum", "industry_season_unicorn_rate",
+    # P5.6: Company age and founding timing features
+    "age_at_batch", "months_to_yc", "slow_to_yc", "founded_in_recession", "founded_in_ai_boom",
 ]
 
 # NLP feature column names (mirrors NLPEmbedder.column_names) for reuse in predict.py
@@ -104,6 +108,10 @@ def _prepare_xy(df: pl.DataFrame, db: Optional[Database] = None) -> Tuple[np.nda
         # P1.1: Funding features
         "has_funding_data", "total_raised_usd", "last_valuation_usd",
         "round_count", "funding_stage_encoded", "years_since_last_round", "investor_quality_score",
+        # P5.2: Industry-batch interaction features
+        "industry_momentum", "industry_season_unicorn_rate",
+        # P5.6: Company age and founding timing features
+        "age_at_batch", "months_to_yc", "slow_to_yc", "founded_in_recession", "founded_in_ai_boom",
     ]
 
     # Select base columns that exist
