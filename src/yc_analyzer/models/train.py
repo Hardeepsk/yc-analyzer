@@ -45,6 +45,8 @@ FEATURE_COLS = [
     "large_team_hot_industry", "small_team_strong_batch", "diverse_tags_large_batch",
     # P5.4: Tag rarity features
     "tag_idf_score", "tag_uniqueness", "tag_trending_score",
+    # P5.3: Geographic density features
+    "hub_unicorn_count", "hub_company_count", "is_in_hub",
 ]
 
 
@@ -100,9 +102,11 @@ def _prepare_xy(df: pl.DataFrame, db: Optional[Database] = None) -> Tuple[np.nda
         ((tags > 3) & (bsize > 100)).astype(float),      # diverse_tags_large_batch
     ])
 
-    # P5.4: Tag rarity features (computed from companies.tags)
+    # P5.4: Tag rarity features
     tag_features = _compute_tag_features(df, db)
-    X = np.hstack([base, interactions, tag_features]).astype(np.float32)
+    # P5.3: Geographic density features
+    geo_features = _compute_geo_features(df, db)
+    X = np.hstack([base, interactions, tag_features, geo_features]).astype(np.float32)
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
     y = df.select("success_at_5yr").to_numpy().astype(np.float32).ravel()
@@ -185,6 +189,67 @@ def _compute_tag_features(df: pl.DataFrame, db: Database) -> np.ndarray:
         # tag_trending_score: average trending score of company's tags
         trending_vals = [tag_trending.get(t, 1.0) for t in tag_list]
         result[i, 2] = np.mean(trending_vals) if trending_vals else 1.0
+
+    return result
+
+
+def _compute_geo_features(df: pl.DataFrame, db: Database) -> np.ndarray:
+    """Compute geographic density features (P5.3).
+
+    - hub_unicorn_count: number of unicorns in the company's primary location
+    - hub_company_count: total companies in that location
+    - is_in_hub: binary flag for top-10 unicorn hubs
+    """
+    logger.info("Computing geographic features...")
+
+    n = len(df)
+    result = np.zeros((n, 3), dtype=np.float32)
+
+    # Get all locations with unicorn counts using CTE with UNNEST
+    try:
+        location_stats = db.conn.execute("""
+            WITH unnested AS (
+                SELECT
+                    UNNEST(all_locations) AS location,
+                    top_company
+                FROM companies
+                WHERE all_locations IS NOT NULL AND len(all_locations) > 0
+            )
+            SELECT
+                location,
+                SUM(CASE WHEN top_company THEN 1 ELSE 0 END) AS unicorns,
+                COUNT(*) AS total
+            FROM unnested
+            GROUP BY location
+        """).fetchall()
+    except Exception:
+        location_stats = []
+
+    loc_unicorn = {r[0]: r[1] for r in location_stats}
+    loc_total = {r[0]: r[2] for r in location_stats}
+
+    # Top-10 hubs by unicorn count
+    top_hubs = sorted(loc_unicorn.items(), key=lambda x: x[1], reverse=True)[:10]
+    hub_set = set(h for h, _ in top_hubs)
+
+    # For each company, get primary location
+    company_ids = df["id"].to_list() if "id" in df.columns else []
+    for i, cid in enumerate(company_ids):
+        row = db.conn.execute(
+            "SELECT all_locations FROM companies WHERE id = ?", [cid]
+        ).fetchone()
+        if not row or not row[0]:
+            continue
+
+        locations = row[0]
+        if not locations:
+            continue
+
+        primary_loc = locations[0] if isinstance(locations, list) else locations
+
+        result[i, 0] = float(loc_unicorn.get(primary_loc, 0))
+        result[i, 1] = float(loc_total.get(primary_loc, 0))
+        result[i, 2] = 1.0 if primary_loc in hub_set else 0.0
 
     return result
 

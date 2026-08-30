@@ -128,7 +128,49 @@ def _get_features(company_id: int, db: Optional[Database] = None) -> Optional[np
     tag_feats = _compute_single_tag_features(company_id, db)
     features.extend(tag_feats)
 
+    # P5.3: Geographic density features
+    geo_feats = _compute_single_geo_features(company_id, db)
+    features.extend(geo_feats)
+
     return np.array(features, dtype=np.float32).reshape(1, -1)
+
+
+def _compute_single_geo_features(company_id: int, db: Database) -> list:
+    """Compute geographic density features for a single company (P5.3)."""
+    # Get company's locations
+    row = db.conn.execute("SELECT all_locations FROM companies WHERE id = ?", [company_id]).fetchone()
+    if not row or not row[0]:
+        return [0.0, 0.0, 0.0]
+
+    locations = row[0]
+    if not locations:
+        return [0.0, 0.0, 0.0]
+
+    primary_loc = locations[0] if isinstance(locations, list) else locations
+
+    # Get location stats
+    stats = db.conn.execute("""
+        SELECT
+            UNNEST(all_locations) AS location,
+            SUM(CASE WHEN top_company THEN 1 ELSE 0 END) AS unicorns,
+            COUNT(*) AS total
+        FROM companies
+        WHERE all_locations IS NOT NULL AND len(all_locations) > 0
+        GROUP BY location
+    """).fetchall()
+
+    loc_unicorn = {r[0]: r[1] for r in stats}
+    loc_total = {r[0]: r[2] for r in stats}
+
+    # Top-10 hubs
+    top_hubs = sorted(loc_unicorn.items(), key=lambda x: x[1], reverse=True)[:10]
+    hub_set = set(h for h, _ in top_hubs)
+
+    return [
+        float(loc_unicorn.get(primary_loc, 0)),   # hub_unicorn_count
+        float(loc_total.get(primary_loc, 0)),      # hub_company_count
+        1.0 if primary_loc in hub_set else 0.0,    # is_in_hub
+    ]
 
 
 def _compute_single_tag_features(company_id: int, db: Database) -> list:
