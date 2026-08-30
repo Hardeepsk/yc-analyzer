@@ -370,6 +370,35 @@ def run_training_pipeline(db: Optional[Database] = None) -> Dict[str, Any]:
         with open(model_dir / "feature_importance_xgb.json", "w") as f:
             json.dump(importance_sorted, f, indent=2)
 
+        # P7.1: Feature selection — drop features with <1% importance
+        selected_indices, selected_names, selected_X_train, selected_X_test = _select_features(
+            importance_sorted, feature_names, X_train, X_test
+        )
+
+        if len(selected_names) < len(feature_names):
+            logger.info(f"P7.1: Selected {len(selected_names)}/{len(feature_names)} features")
+            logger.info(f"P7.1: Dropped: {[n for n in feature_names if n not in selected_names]}")
+
+            # Retrain XGBoost on selected features
+            xgb_selected = train_xgboost(selected_X_train, y_train)
+            if xgb_selected is not None:
+                xgb_sel_metrics = evaluate_model(xgb_selected, None, selected_X_test, y_test, "XGBoost_Selected", selected_names, xgb_model=True)
+                all_metrics["xgboost_selected"] = xgb_sel_metrics
+                logger.info(f"XGBoost (selected) AUC: {xgb_sel_metrics.get('auc_roc', 'N/A')}")
+
+                # Save if better
+                if xgb_sel_metrics.get('auc_roc', 0) > xgb_metrics.get('auc_roc', 0):
+                    xgb_selected.save_model(str(model_dir / "xgb_success_v1.json"))
+                    logger.info("P7.1: Selected features model is BETTER — saved as primary")
+                    # Update feature importance
+                    imp_sel = dict(zip(selected_names, xgb_selected.get_fscore().values()))
+                    imp_sel_sorted = dict(sorted(imp_sel.items(), key=lambda x: x[1], reverse=True))
+                    with open(model_dir / "feature_importance_xgb.json", "w") as f:
+                        json.dump(imp_sel_sorted, f, indent=2)
+                    # Save selected feature names
+                    with open(model_dir / "selected_features.json", "w") as f:
+                        json.dump(selected_names, f, indent=2)
+
     # LightGBM
     lgb_model = train_lightgbm(X_train, y_train)
     if lgb_model is not None:
@@ -392,6 +421,39 @@ def run_training_pipeline(db: Optional[Database] = None) -> Dict[str, Any]:
 
     logger.info(f"Models and metrics saved to {model_dir}")
     return all_metrics
+
+
+def _select_features(
+    importance_sorted: Dict[str, float],
+    feature_names: List[str],
+    X_train: np.ndarray,
+    X_test: np.ndarray,
+    threshold_pct: float = 0.01,
+) -> Tuple[List[int], List[str], np.ndarray, np.ndarray]:
+    """Select features with importance above threshold percentage of max.
+
+    Returns (indices, names, filtered_X_train, filtered_X_test).
+    """
+    if not importance_sorted:
+        return list(range(len(feature_names))), feature_names, X_train, X_test
+
+    max_imp = max(importance_sorted.values())
+    if max_imp <= 0:
+        return list(range(len(feature_names))), feature_names, X_train, X_test
+
+    # Keep features with importance > threshold% of max
+    min_importance = max_imp * threshold_pct
+    selected = [name for name, imp in importance_sorted.items() if imp >= min_importance]
+
+    # Always keep at least top-10 features
+    if len(selected) < 10:
+        selected = list(importance_sorted.keys())[:10]
+
+    # Map back to indices
+    name_to_idx = {name: i for i, name in enumerate(feature_names)}
+    indices = [name_to_idx[name] for name in selected if name in name_to_idx]
+
+    return indices, selected, X_train[:, indices], X_test[:, indices]
 
 
 if __name__ == "__main__":
