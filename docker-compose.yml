@@ -1,0 +1,89 @@
+version: '3.8'
+
+services:
+  # API Service
+  api:
+    build: .
+    container_name: yc-analyzer-api
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONPATH=/app/src
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    command: python scripts/serve_api.py
+
+  # Dashboard Service
+  dashboard:
+    build: .
+    container_name: yc-analyzer-dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      - PYTHONPATH=/app/src
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+    depends_on:
+      - api
+    restart: unless-stopped
+    command: python scripts/serve_dashboard.py
+
+  # Training Service (run on demand)
+  trainer:
+    build: .
+    container_name: yc-analyzer-trainer
+    environment:
+      - PYTHONPATH=/app/src
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+    profiles:
+      - training
+    command: python scripts/train.py
+
+  # Data Ingestion Service (run on demand)
+  ingest:
+    build: .
+    container_name: yc-analyzer-ingest
+    environment:
+      - PYTHONPATH=/app/src
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./data:/app/data
+    profiles:
+      - data
+    command: python scripts/ingest.py
+
+  # Funding Enrichment Service (run on demand)
+  enrich:
+    build: .
+    container_name: yc-analyzer-enrich
+    environment:
+      - PYTHONPATH=/app/src
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+    profiles:
+      - data
+    command: python scripts/enrich_funding.py
+
+volumes:
+  yc-data:
+  yc-models:
+
+networks:
+  default:
+    name: yc-analyzer-network

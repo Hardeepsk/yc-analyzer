@@ -1,0 +1,76 @@
+# YC Analyzer - Docker ignore
+
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.pytest_cache
+.coverage
+htmlcov
+.tox
+.nox
+.mypy_cache
+.ruff_cache
+
+# Virtual environments
+venv
+env
+.env
+.venv
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Data (large files - mounted as volumes)
+data/*.duckdb
+data/raw/*.json
+data/raw/*.parquet
+data/processed/
+
+# Models (large files - mounted as volumes)
+models/*.json
+models/*.txt
+models/*.pkl
+models/*.npz
+models/*.joblib
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Documentation
+docs/
+*.md
+!README.md
+
+# Test files
+tests/
+*.test.py
+test_*.py
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+
+# Local development
+*.local
+local/
