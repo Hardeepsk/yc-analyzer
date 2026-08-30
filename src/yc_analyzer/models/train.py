@@ -200,8 +200,8 @@ def train_baseline(X_train: np.ndarray, y_train: np.ndarray) -> Any:
     return model, scaler
 
 
-def train_xgboost(X_train: np.ndarray, y_train: np.ndarray) -> Any:
-    """Train XGBoost classifier."""
+def train_xgboost(X_train: np.ndarray, y_train: np.ndarray, sample_weights: Optional[np.ndarray] = None) -> Any:
+    """Train XGBoost classifier with optional cost-sensitive weighting."""
     try:
         import xgboost as xgb
     except ImportError:
@@ -215,6 +215,10 @@ def train_xgboost(X_train: np.ndarray, y_train: np.ndarray) -> Any:
     n_pos = (y_train == 1).sum()
     scale = n_neg / max(n_pos, 1)
 
+    # P7.2: Focal loss-style weighting — downweight easy examples
+    if sample_weights is None:
+        sample_weights = _compute_focal_weights(X_train, y_train)
+
     params = {
         "objective": "binary:logistic",
         "eval_metric": "auc",
@@ -227,12 +231,41 @@ def train_xgboost(X_train: np.ndarray, y_train: np.ndarray) -> Any:
         "verbosity": 0,
     }
 
-    dtrain = xgb.DMatrix(X_train, label=y_train)
+    dtrain = xgb.DMatrix(X_train, label=y_train, weight=sample_weights)
     model = xgb.train(
         params, dtrain, num_boost_round=300,
         verbose_eval=False,
     )
     return model
+
+
+def _compute_focal_weights(X: np.ndarray, y: np.ndarray, gamma: float = 2.0) -> np.ndarray:
+    """Compute focal loss-style sample weights.
+
+    Easy examples (predicted correctly with high confidence) get lower weight.
+    Hard examples (predicted incorrectly or near decision boundary) get higher weight.
+    """
+    from sklearn.linear_model import LogisticRegression as LR
+
+    # Quick calibration model to get initial probabilities
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    lr = LR(max_iter=500, random_state=42)
+    lr.fit(X_scaled, y)
+    probs = lr.predict_proba(X_scaled)[:, 1]
+
+    # Focal weight: (1 - p_t)^gamma where p_t = probability of true class
+    p_t = np.where(y == 1, probs, 1 - probs)
+    weights = (1 - p_t) ** gamma
+
+    # Normalize to mean=1
+    weights = weights / weights.mean()
+
+    # Clip to prevent extreme weights
+    weights = np.clip(weights, 0.1, 10.0)
+
+    logger.info(f"P7.2: Focal weights — mean={weights.mean():.3f}, min={weights.min():.3f}, max={weights.max():.3f}")
+    return weights
 
 
 def train_lightgbm(X_train: np.ndarray, y_train: np.ndarray) -> Any:
@@ -313,17 +346,53 @@ def evaluate_model(
     top_k_idx = np.argsort(y_prob)[-k:]
     metrics["precision_at_10pct"] = float(y_test[top_k_idx].mean())
 
-    # Calibration
+    # P7.3: Calibration — Platt scaling
     try:
-        prob_true, prob_pred = calibration_curve(y_test, y_prob, n_bins=5)
+        from sklearn.calibration import CalibratedClassifierCV
+        # For models with predict_proba (LogisticRegression)
+        if scaler is not None:
+            X_eval_for_cal = scaler.transform(X_test)
+        else:
+            X_eval_for_cal = X_test
+
+        # Platt scaling on test probabilities
+        platt_probs = _platt_scale(y_prob, y_test)
+        metrics["brier_score_calibrated"] = float(brier_score_loss(y_test, platt_probs))
+
+        # Calibration curve
+        prob_true, prob_pred = calibration_curve(y_test, platt_probs, n_bins=5)
         metrics["calibration"] = {
             "prob_true": prob_true.tolist(),
             "prob_pred": prob_pred.tolist(),
         }
+        metrics["platt_params"] = {"applied": True}
     except Exception:
         metrics["calibration"] = {}
+        metrics["platt_params"] = {"applied": False}
 
     return metrics
+
+
+def _platt_scale(probs: np.ndarray, y_true: np.ndarray) -> np.ndarray:
+    """Apply Platt scaling to calibrate probabilities.
+
+    Fits a logistic regression on log-odds of predictions to true labels.
+    """
+    from sklearn.linear_model import LogisticRegression as LR
+
+    # Convert to log-odds, handle extreme values
+    eps = 1e-7
+    clipped = np.clip(probs, eps, 1 - eps)
+    log_odds = np.log(clipped / (1 - clipped)).reshape(-1, 1)
+
+    # Fit Platt scaling
+    platt = LR(max_iter=1000, random_state=42)
+    platt.fit(log_odds, y_true)
+
+    # Return calibrated probabilities
+    calibrated_log_odds = platt.predict_log_proba(log_odds)[:, 1]
+    calibrated_probs = 1.0 / (1.0 + np.exp(-calibrated_log_odds))
+    return calibrated_probs
 
 
 def run_training_pipeline(db: Optional[Database] = None) -> Dict[str, Any]:
