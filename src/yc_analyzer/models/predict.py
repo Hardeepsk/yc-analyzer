@@ -132,6 +132,10 @@ def _get_features(company_id: int, db: Optional[Database] = None) -> Optional[np
     geo_feats = _compute_single_geo_features(company_id, db)
     features.extend(geo_feats)
 
+    # P5.5: Batch momentum features
+    momentum_feats = _compute_single_momentum_features(company_id, db)
+    features.extend(momentum_feats)
+
     return np.array(features, dtype=np.float32).reshape(1, -1)
 
 
@@ -171,6 +175,57 @@ def _compute_single_geo_features(company_id: int, db: Database) -> list:
         float(loc_total.get(primary_loc, 0)),      # hub_company_count
         1.0 if primary_loc in hub_set else 0.0,    # is_in_hub
     ]
+
+
+def _compute_single_momentum_features(company_id: int, db: Database) -> list:
+    """Compute batch momentum features for a single company (P5.5)."""
+    # Get company's batch
+    row = db.conn.execute("SELECT batch FROM companies WHERE id = ?", [company_id]).fetchone()
+    if not row or not row[0]:
+        return [0.0, 0.0, 0.0, 0.0, 0.0]
+
+    batch = row[0]
+
+    # Get batch stats ordered by batch
+    batch_rows = db.conn.execute("""
+        SELECT batch, company_count, survival_rate, unicorn_count, exit_count
+        FROM batches
+        ORDER BY batch
+    """).fetchall()
+
+    if len(batch_rows) < 2:
+        return [0.0, 0.0, 0.0, 0.0, 0.0]
+
+    # Find current batch index
+    batch_list = [r[0] for r in batch_rows]
+    try:
+        idx = batch_list.index(batch)
+    except ValueError:
+        return [0.0, 0.0, 0.0, 0.0, 0.0]
+
+    if idx == 0:
+        return [0.0, 0.0, 0.0, 0.0, 0.0]
+
+    # Compute momentum vs previous batch
+    curr = batch_rows[idx]
+    prev = batch_rows[idx-1]
+
+    prev_companies = prev[1] if prev[1] > 0 else 1
+    curr_companies = curr[1] if curr[1] > 0 else 1
+
+    unicorn_growth = (curr[3] / curr_companies) - (prev[3] / prev_companies)
+    exit_growth = (curr[4] / curr_companies) - (prev[4] / prev_companies)
+    size_growth = (curr_companies - prev_companies) / prev_companies
+
+    # Survival trend (3-batch)
+    survival_trend = 0.0
+    if idx >= 3:
+        survival_trend = (curr[2] - batch_rows[idx-3][2]) / 3.0
+
+    # Composite momentum
+    momentum = unicorn_growth * 2 + exit_growth * 1.5 + size_growth * 0.5 + survival_trend * 1.0
+
+    return [unicorn_growth, exit_growth, size_growth, survival_trend, momentum]
 
 
 def _compute_single_tag_features(company_id: int, db: Database) -> list:

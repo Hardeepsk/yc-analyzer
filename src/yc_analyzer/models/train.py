@@ -47,6 +47,9 @@ FEATURE_COLS = [
     "tag_idf_score", "tag_uniqueness", "tag_trending_score",
     # P5.3: Geographic density features
     "hub_unicorn_count", "hub_company_count", "is_in_hub",
+    # P5.5: Batch momentum features
+    "batch_unicorn_growth", "batch_exit_growth", "batch_size_growth",
+    "batch_survival_trend", "batch_momentum_score",
 ]
 
 
@@ -106,7 +109,9 @@ def _prepare_xy(df: pl.DataFrame, db: Optional[Database] = None) -> Tuple[np.nda
     tag_features = _compute_tag_features(df, db)
     # P5.3: Geographic density features
     geo_features = _compute_geo_features(df, db)
-    X = np.hstack([base, interactions, tag_features, geo_features]).astype(np.float32)
+    # P5.5: Batch momentum features
+    momentum_features = _compute_momentum_features(df, db)
+    X = np.hstack([base, interactions, tag_features, geo_features, momentum_features]).astype(np.float32)
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
     y = df.select("success_at_5yr").to_numpy().astype(np.float32).ravel()
@@ -250,6 +255,89 @@ def _compute_geo_features(df: pl.DataFrame, db: Database) -> np.ndarray:
         result[i, 0] = float(loc_unicorn.get(primary_loc, 0))
         result[i, 1] = float(loc_total.get(primary_loc, 0))
         result[i, 2] = 1.0 if primary_loc in hub_set else 0.0
+
+    return result
+
+
+def _compute_momentum_features(df: pl.DataFrame, db: Database) -> np.ndarray:
+    """Compute batch momentum features (P5.5).
+
+    - batch_unicorn_growth: change in unicorn density vs previous batch
+    - batch_exit_growth: change in exit rate vs previous batch
+    - batch_size_growth: change in batch size vs previous batch
+    - batch_survival_trend: trend in survival rate over last 3 batches
+    - batch_momentum_score: composite momentum score
+    """
+    logger.info("Computing batch momentum features...")
+
+    n = len(df)
+    result = np.zeros((n, 5), dtype=np.float32)
+
+    # Get batch stats ordered by batch
+    batch_rows = db.conn.execute("""
+        SELECT batch, company_count, survival_rate, unicorn_count, exit_count
+        FROM batches
+        ORDER BY batch
+    """).fetchall()
+
+    if len(batch_rows) < 2:
+        return result
+
+    # Build batch index and compute deltas
+    batch_list = [r[0] for r in batch_rows]
+    unicorn_counts = [r[3] for r in batch_rows]
+    exit_counts = [r[4] for r in batch_rows]
+    company_counts = [r[1] for r in batch_rows]
+    survival_rates = [r[2] for r in batch_rows]
+
+    # Compute per-batch growth metrics
+    batch_unicorn_growth = {}
+    batch_exit_growth = {}
+    batch_size_growth = {}
+    batch_survival_trend = {}
+
+    for i in range(1, len(batch_rows)):
+        prev_companies = company_counts[i-1] if company_counts[i-1] > 0 else 1
+        curr_companies = company_counts[i] if company_counts[i] > 0 else 1
+
+        # Unicorn density growth
+        prev_density = unicorn_counts[i-1] / prev_companies
+        curr_density = unicorn_counts[i] / curr_companies
+        batch_unicorn_growth[batch_list[i]] = curr_density - prev_density
+
+        # Exit rate growth
+        prev_exit_rate = exit_counts[i-1] / prev_companies
+        curr_exit_rate = exit_counts[i] / curr_companies
+        batch_exit_growth[batch_list[i]] = curr_exit_rate - prev_exit_rate
+
+        # Size growth
+        batch_size_growth[batch_list[i]] = (curr_companies - prev_companies) / prev_companies
+
+        # Survival trend (3-batch)
+        if i >= 3:
+            batch_survival_trend[batch_list[i]] = (
+                survival_rates[i] - survival_rates[i-3]
+            ) / 3.0
+
+    # Map to companies
+    company_ids = df["id"].to_list() if "id" in df.columns else []
+    company_batches = df["batch"].to_list() if "batch" in df.columns else []
+
+    for i, (cid, batch) in enumerate(zip(company_ids, company_batches)):
+        if not batch:
+            continue
+
+        result[i, 0] = batch_unicorn_growth.get(batch, 0.0)
+        result[i, 1] = batch_exit_growth.get(batch, 0.0)
+        result[i, 2] = batch_size_growth.get(batch, 0.0)
+        result[i, 3] = batch_survival_trend.get(batch, 0.0)
+        # Composite momentum score
+        result[i, 4] = (
+            result[i, 0] * 2 +   # unicorn growth weighted more
+            result[i, 1] * 1.5 + # exit growth
+            result[i, 2] * 0.5 + # size growth
+            result[i, 3] * 1.0   # survival trend
+        )
 
     return result
 
