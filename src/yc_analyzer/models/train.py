@@ -399,6 +399,50 @@ def run_training_pipeline(db: Optional[Database] = None) -> Dict[str, Any]:
                     with open(model_dir / "selected_features.json", "w") as f:
                         json.dump(selected_names, f, indent=2)
 
+        # P7.5: Pseudo-labeling — expand training set with high-confidence predictions
+        xgb_pseudo, y_pseudo = _pseudo_label(xgb_model, db, feature_names)
+        if len(y_pseudo) > 0:
+            # Combine original + pseudo-labeled data
+            X_train_aug = np.vstack([X_train, xgb_pseudo])
+            y_train_aug = np.concatenate([y_train, y_pseudo])
+
+            # Assign sample weights: 1.0 for real, 0.5 for pseudo
+            sample_weights = np.concatenate([
+                np.ones(len(y_train)),
+                np.full(len(y_pseudo), 0.5),
+            ])
+
+            logger.info(f"P7.5: Training with {len(y_train)} real + {len(y_pseudo)} pseudo = {len(y_train_aug)} total")
+
+            # Retrain XGBoost with sample weights
+            try:
+                import xgboost as xgb_lib
+                dtrain_aug = xgb_lib.DMatrix(X_train_aug, label=y_train_aug, weight=sample_weights)
+                n_neg = (y_train_aug == 0).sum()
+                n_pos = (y_train_aug == 1).sum()
+                scale = n_neg / max(n_pos, 1)
+                params = {
+                    "objective": "binary:logistic", "eval_metric": "auc",
+                    "max_depth": 5, "learning_rate": 0.05,
+                    "subsample": 0.8, "colsample_bytree": 0.8,
+                    "scale_pos_weight": float(scale), "seed": 42, "verbosity": 0,
+                }
+                xgb_pseudo_model = xgb_lib.train(params, dtrain_aug, num_boost_round=300)
+                pseudo_metrics = evaluate_model(xgb_pseudo_model, None, X_test, y_test, "XGBoost_Pseudo", feature_names, xgb_model=True)
+                all_metrics["xgboost_pseudo"] = pseudo_metrics
+                logger.info(f"XGBoost (pseudo-labeled) AUC: {pseudo_metrics.get('auc_roc', 'N/A')}")
+
+                # Save if better
+                best_auc = max(
+                    all_metrics.get("xgboost", {}).get("auc_roc", 0),
+                    all_metrics.get("xgboost_selected", {}).get("auc_roc", 0),
+                )
+                if pseudo_metrics.get("auc_roc", 0) > best_auc:
+                    xgb_pseudo_model.save_model(str(model_dir / "xgb_success_v1.json"))
+                    logger.info("P7.5: Pseudo-labeled model is BEST — saved as primary")
+            except Exception as e:
+                logger.warning(f"P7.5: Pseudo-labeling failed: {e}")
+
     # LightGBM
     lgb_model = train_lightgbm(X_train, y_train)
     if lgb_model is not None:
@@ -421,6 +465,89 @@ def run_training_pipeline(db: Optional[Database] = None) -> Dict[str, Any]:
 
     logger.info(f"Models and metrics saved to {model_dir}")
     return all_metrics
+
+
+def _pseudo_label(
+    xgb_model: Any,
+    db: Database,
+    feature_names: List[str],
+    confidence_threshold: float = 0.80,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """P7.5: Generate pseudo-labels for unlabeled companies.
+
+    Uses the trained XGBoost model to predict on companies without5yr labels,
+    then adds high-confidence predictions (>80% or <20%) as training data.
+    Returns (X_pseudo, y_pseudo).
+    """
+    logger.info("P7.5: Generating pseudo-labels for unlabeled companies...")
+
+    # Get unlabeled companies (no success_at_5yr label, not censored)
+    unlabeled_df = pl.from_arrow(db.conn.execute("""
+        SELECT c.id
+        FROM companies c
+        LEFT JOIN companies_enriched ce ON c.id = ce.company_id
+        WHERE ce.success_at_5yr IS NULL
+          AND (ce.is_censored = FALSE OR ce.is_censored IS NULL)
+    """).arrow())
+
+    if len(unlabeled_df) == 0:
+        logger.info("P7.5: No unlabeled companies found")
+        return np.array([]), np.array([])
+
+    # Prepare features for unlabeled companies
+    unlabeled_ids = unlabeled_df["id"].to_list()
+
+    # We need to prepare features using the same pipeline
+    # Build a mini DataFrame with all the enriched columns
+    placeholders = pl.DataFrame({"id": unlabeled_ids})
+
+    # Join with enriched to get base features
+    enriched_query = """
+        SELECT ce.*, c.batch, c.tags, c.industry
+        FROM companies_enriched ce
+        JOIN companies c ON c.id = ce.company_id
+        WHERE ce.company_id IN ({})
+    """.format(",".join(str(i) for i in unlabeled_ids))
+
+    try:
+        unlabeled_full = pl.from_arrow(db.conn.execute(enriched_query).arrow())
+    except Exception as e:
+        logger.warning(f"P7.5: Could not load unlabeled data: {e}")
+        return np.array([]), np.array([])
+
+    # Prepare features using same pipeline
+    X_unlabeled, _, _ = _prepare_xy(unlabeled_full, db)
+
+    # Get predictions
+    import xgboost as xgb_lib
+    dmat = xgb_lib.DMatrix(X_unlabeled)
+    probs = xgb_model.predict(dmat)
+
+    # Select high-confidence predictions
+    high_pos = probs >= confidence_threshold
+    high_neg = probs <= (1.0 - confidence_threshold)
+
+    X_pseudo_list = []
+    y_pseudo_list = []
+
+    if high_pos.any():
+        X_pseudo_list.append(X_unlabeled[high_pos])
+        y_pseudo_list.append(np.ones(high_pos.sum()))
+        logger.info(f"P7.5: {high_pos.sum()} high-confidence positive pseudo-labels")
+
+    if high_neg.any():
+        X_pseudo_list.append(X_unlabeled[high_neg])
+        y_pseudo_list.append(np.zeros(high_neg.sum()))
+        logger.info(f"P7.5: {high_neg.sum()} high-confidence negative pseudo-labels")
+
+    if not X_pseudo_list:
+        return np.array([]), np.array([])
+
+    X_pseudo = np.vstack(X_pseudo_list)
+    y_pseudo = np.concatenate(y_pseudo_list)
+
+    logger.info(f"P7.5: Total pseudo-labeled: {len(y_pseudo)} companies")
+    return X_pseudo, y_pseudo
 
 
 def _select_features(
