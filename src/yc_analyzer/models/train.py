@@ -1036,6 +1036,16 @@ def run_training_pipeline(db: Optional[Database] = None) -> Dict[str, Any]:
         with open(model_dir / "feature_importance_lgb.json", "w") as f:
             json.dump(lgb_imp_sorted, f, indent=2)
 
+    # P7.4: Ensemble stacking
+    logger.info("P7.4: Building stacking ensemble...")
+    ensemble_metrics = build_stacking_ensemble(
+        lr_model, xgb_model, lgb_model, lr_scaler,
+        X_train, y_train, X_test, y_test, feature_names, model_dir
+    )
+    if ensemble_metrics:
+        all_metrics["ensemble_stacking"] = ensemble_metrics
+        logger.info(f"Ensemble Stacking AUC: {ensemble_metrics.get('auc_roc', 'N/A')}")
+
     # Save metrics
     with open(model_dir / "metrics.json", "w") as f:
         json.dump(all_metrics, f, indent=2, default=str)
@@ -1051,6 +1061,145 @@ def run_training_pipeline(db: Optional[Database] = None) -> Dict[str, Any]:
 
     logger.info(f"Models and metrics saved to {model_dir}")
     return all_metrics
+
+
+def build_stacking_ensemble(
+    lr_model: Any, xgb_model: Any, lgb_model: Any, lr_scaler: Any,
+    X_train: np.ndarray, y_train: np.ndarray, X_test: np.ndarray, y_test: np.ndarray,
+    feature_names: List[str], model_dir: Path
+) -> Optional[Dict[str, Any]]:
+    """Build a simple stacking ensemble from base models using manual meta-learner."""
+    try:
+        from sklearn.linear_model import LogisticRegression as LR
+        from sklearn.calibration import CalibratedClassifierCV
+        from sklearn.model_selection import KFold
+        import joblib
+        
+        # Get out-of-fold predictions from each base model for meta-learner training
+        n_splits = 3
+        kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+        
+        # Collect base model predictions
+        base_preds_train = []
+        base_preds_test = []
+        model_names = []
+        
+        # Logistic Regression
+        if lr_model is not None and lr_scaler is not None:
+            lr_calibrated = CalibratedClassifierCV(lr_model, cv=3, method='isotonic')
+            lr_calibrated.fit(lr_scaler.transform(X_train), y_train)
+            
+            # OOF predictions for training meta-learner
+            oof_preds = np.zeros(len(X_train))
+            for train_idx, val_idx in kf.split(X_train):
+                X_tr, X_val = X_train[train_idx], X_train[val_idx]
+                y_tr = y_train[train_idx]
+                lr_fold = CalibratedClassifierCV(lr_model, cv=3, method='isotonic')
+                lr_fold.fit(lr_scaler.transform(X_tr), y_tr)
+                oof_preds[val_idx] = lr_fold.predict_proba(lr_scaler.transform(X_val))[:, 1]
+            
+            base_preds_train.append(oof_preds)
+            base_preds_test.append(lr_calibrated.predict_proba(lr_scaler.transform(X_test))[:, 1])
+            model_names.append('lr')
+        
+        # XGBoost
+        if xgb_model is not None:
+            import xgboost as xgb_lib
+            oof_preds = np.zeros(len(X_train))
+            for train_idx, val_idx in kf.split(X_train):
+                X_tr, X_val = X_train[train_idx], X_train[val_idx]
+                y_tr = y_train[train_idx]
+                dtrain = xgb_lib.DMatrix(X_tr, label=y_tr)
+                dval = xgb_lib.DMatrix(X_val)
+                params = xgb_model.get_params() if hasattr(xgb_model, 'get_params') else {}
+                bst = xgb_lib.train(params, dtrain, num_boost_round=100)
+                oof_preds[val_idx] = bst.predict(dval)
+            
+            base_preds_train.append(oof_preds)
+            dtest = xgb_lib.DMatrix(X_test)
+            base_preds_test.append(xgb_model.predict(dtest))
+            model_names.append('xgb')
+        
+        # LightGBM
+        if lgb_model is not None:
+            import lightgbm as lgb_lib
+            oof_preds = np.zeros(len(X_train))
+            for train_idx, val_idx in kf.split(X_train):
+                X_tr, X_val = X_train[train_idx], X_train[val_idx]
+                y_tr = y_train[train_idx]
+                dtrain = lgb_lib.Dataset(X_tr, label=y_tr)
+                params = lgb_model.params if hasattr(lgb_model, 'params') else {'objective': 'binary', 'verbosity': -1}
+                bst = lgb_lib.train(params, dtrain, num_boost_round=100)
+                oof_preds[val_idx] = bst.predict(X_val)
+            
+            base_preds_train.append(oof_preds)
+            base_preds_test.append(lgb_model.predict(X_test))
+            model_names.append('lgb')
+        
+        if len(base_preds_train) < 2:
+            logger.warning("Not enough base models for stacking")
+            return None
+        
+        # Stack predictions as meta-features
+        meta_X_train = np.column_stack(base_preds_train)
+        meta_X_test = np.column_stack(base_preds_test)
+        
+        # Train meta-learner
+        meta_learner = LR(max_iter=1000, random_state=42)
+        meta_learner.fit(meta_X_train, y_train)
+        
+        # Final ensemble predictions
+        y_prob = meta_learner.predict_proba(meta_X_test)[:, 1]
+        y_pred = (y_prob > 0.5).astype(int)
+        
+        # Save ensemble components
+        ensemble = {
+            'base_model_names': model_names,
+            'meta_learner': meta_learner,
+            'lr_scaler': lr_scaler,
+            'lr_model': lr_model,
+            'xgb_model': xgb_model,
+            'lgb_model': lgb_model,
+        }
+        joblib.dump(ensemble, model_dir / "ensemble_stacking.pkl")
+        
+        # Evaluate
+        from sklearn.metrics import roc_auc_score, average_precision_score, brier_score_loss
+        from sklearn.metrics import classification_report, confusion_matrix
+        
+        metrics = {
+            "model_name": "ensemble_stacking",
+            "auc_roc": float(roc_auc_score(y_test, y_prob)),
+            "auc_pr": float(average_precision_score(y_test, y_prob)),
+            "brier_score": float(brier_score_loss(y_test, y_prob)),
+            "classification_report": classification_report(y_test, y_pred, output_dict=True, zero_division=0),
+            "confusion_matrix": confusion_matrix(y_test, y_pred).tolist(),
+        }
+        
+        # Precision@10%
+        k = max(1, int(len(y_test) * 0.1))
+        top_k_idx = np.argsort(y_prob)[-k:]
+        metrics["precision_at_10pct"] = float(y_test[top_k_idx].mean())
+        
+        # Calibration
+        try:
+            from sklearn.calibration import calibration_curve
+            prob_true, prob_pred = calibration_curve(y_test, y_prob, n_bins=5)
+            metrics["calibration"] = {
+                "prob_true": prob_true.tolist(),
+                "prob_pred": prob_pred.tolist(),
+            }
+        except Exception:
+            metrics["calibration"] = {}
+        
+        logger.info(f"Stacking ensemble built with {len(model_names)} base models: {model_names}")
+        return metrics
+        
+    except Exception as e:
+        logger.warning(f"Stacking ensemble failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 
 def compute_shap_values(model: Any, X: np.ndarray, feature_names: List[str], model_name: str, model_dir: Path, scaler: Any = None) -> None:
