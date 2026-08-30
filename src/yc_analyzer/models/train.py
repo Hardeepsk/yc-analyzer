@@ -24,6 +24,7 @@ from yc_analyzer.models.labeling import get_labeled_training_data, get_holdout_d
 
 # Feature columns used for training (numeric/boolean only)
 FEATURE_COLS = [
+    # Base features
     "years_since_batch", "team_size", "tag_count", "location_count",
     "has_website", "is_top_company", "is_nonprofit", "is_hiring",
     "batch_size", "batch_survival_rate", "batch_unicorn_count",
@@ -31,19 +32,76 @@ FEATURE_COLS = [
     "industry_company_count", "industry_exit_rate",
     "fed_funds_rate_at_batch", "nasdaq_return_1yr_post_batch",
     "ai_hype_index_at_batch",
+    # P5.1: Interaction features
+    "team_x_industry_exit", "team_x_batch_survival",
+    "batch_survival_x_maturity", "industry_density_x_exit_rate",
+    "tags_x_team", "location_x_industry_exit",
+    "unicorn_density_x_maturity",
+    # P5.1: Polynomial features
+    "team_size_sq", "years_since_batch_sq", "batch_survival_sq",
+    # P5.1: Ratio features
+    "team_dominance_ratio", "batch_unicorn_density", "batch_exit_density",
+    # P5.1: Binary interaction flags
+    "large_team_hot_industry", "small_team_strong_batch", "diverse_tags_large_batch",
 ]
 
 
 def _prepare_xy(df: pl.DataFrame) -> Tuple[np.ndarray, np.ndarray, List[str]]:
-    """Extract feature matrix X and label vector y from polars DataFrame."""
-    cols = [c for c in FEATURE_COLS if c in df.columns]
-    X = df.select(cols).to_numpy().astype(np.float32)
-    y = df.select("success_at_5yr").to_numpy().astype(np.float32).ravel()
+    """Extract feature matrix X and label vector y, computing interactions from base features."""
+    # Base feature columns (stored in DB)
+    BASE_COLS = [
+        "years_since_batch", "team_size", "tag_count", "location_count",
+        "has_website", "is_top_company", "is_nonprofit", "is_hiring",
+        "batch_size", "batch_survival_rate", "batch_unicorn_count",
+        "batch_exit_count", "batch_avg_team_size",
+        "industry_company_count", "industry_exit_rate",
+        "fed_funds_rate_at_batch", "nasdaq_return_1yr_post_batch",
+        "ai_hype_index_at_batch",
+    ]
 
-    # Fill NaN/Inf
+    # Select base columns that exist
+    cols = [c for c in BASE_COLS if c in df.columns]
+    base = df.select(cols).to_numpy().astype(np.float32)
+    base = np.nan_to_num(base, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Unpack for interaction computation
+    years = base[:, 0] if len(cols) > 0 else np.zeros(len(df))
+    team = base[:, 1] if len(cols) > 1 else np.zeros(len(df))
+    tags = base[:, 2] if len(cols) > 2 else np.zeros(len(df))
+    locs = base[:, 3] if len(cols) > 3 else np.zeros(len(df))
+    bsize = base[:, 8] if len(cols) > 8 else np.zeros(len(df))
+    bsurv = base[:, 9] if len(cols) > 9 else np.zeros(len(df))
+    buni = base[:, 10] if len(cols) > 10 else np.zeros(len(df))
+    bexit = base[:, 11] if len(cols) > 11 else np.zeros(len(df))
+    ico_count = base[:, 13] if len(cols) > 13 else np.zeros(len(df))
+    ico_rate = base[:, 14] if len(cols) > 14 else np.zeros(len(df))
+
+    # Compute interactions (must match predict.py exactly)
+    interactions = np.column_stack([
+        team * ico_rate,                        # team_x_industry_exit
+        team * bsurv,                           # team_x_batch_survival
+        bsurv * years,                          # batch_survival_x_maturity
+        ico_count * ico_rate,                   # industry_density_x_exit_rate
+        tags * team,                            # tags_x_team
+        locs * ico_rate,                        # location_x_industry_exit
+        buni * years,                           # unicorn_density_x_maturity
+        team ** 2,                              # team_size_sq
+        years ** 2,                             # years_since_batch_sq
+        bsurv ** 2,                             # batch_survival_sq
+        np.where(bsize > 0, team / bsize, 0.0),          # team_dominance_ratio
+        np.where(bsize > 0, buni / bsize, 0.0),          # batch_unicorn_density
+        np.where(bsize > 0, bexit / bsize, 0.0),         # batch_exit_density
+        ((team > 10) & (ico_rate > 0.1)).astype(float),  # large_team_hot_industry
+        ((team <= 5) & (bsurv > 0.5)).astype(float),     # small_team_strong_batch
+        ((tags > 3) & (bsize > 100)).astype(float),      # diverse_tags_large_batch
+    ])
+
+    X = np.hstack([base, interactions]).astype(np.float32)
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
-    return X, y, cols
+    y = df.select("success_at_5yr").to_numpy().astype(np.float32).ravel()
+
+    return X, y, FEATURE_COLS
 
 
 def train_baseline(X_train: np.ndarray, y_train: np.ndarray) -> Any:

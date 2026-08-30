@@ -51,9 +51,10 @@ def _load_models() -> Dict[str, Any]:
 
 
 def _get_features(company_id: int, db: Optional[Database] = None) -> Optional[np.ndarray]:
-    """Get feature vector for a company."""
+    """Get feature vector for a company, including computed interactions."""
     db = db or get_db()
 
+    # Get base features from DB
     row = db.conn.execute("""
         SELECT
             ce.years_since_batch, ce.team_size, ce.tag_count, ce.location_count,
@@ -70,7 +71,60 @@ def _get_features(company_id: int, db: Optional[Database] = None) -> Optional[np
     if row is None:
         return None
 
-    return np.array(row, dtype=np.float32).reshape(1, -1)
+    # Unpack base features
+    (years_since_batch, team_size, tag_count, location_count,
+     has_website, is_top_company, is_nonprofit, is_hiring,
+     batch_size, batch_survival_rate, batch_unicorn_count,
+     batch_exit_count, batch_avg_team_size,
+     industry_company_count, industry_exit_rate,
+     fed_funds_rate, nasdaq_return, ai_hype) = row
+
+    # Fill None values
+    team_size = team_size or 0
+    tag_count = tag_count or 0
+    location_count = location_count or 0
+    batch_size = batch_size or 0
+    batch_survival_rate = batch_survival_rate or 0.0
+    batch_unicorn_count = batch_unicorn_count or 0
+    batch_exit_count = batch_exit_count or 0
+    batch_avg_team_size = batch_avg_team_size or 0.0
+    industry_company_count = industry_company_count or 0
+    industry_exit_rate = industry_exit_rate or 0.0
+    years_since_batch = years_since_batch or 0.0
+
+    # Compute interaction features (P5.1)
+    features = [
+        # Base (18)
+        years_since_batch, team_size, tag_count, location_count,
+        1.0 if has_website else 0.0, 1.0 if is_top_company else 0.0,
+        1.0 if is_nonprofit else 0.0, 1.0 if is_hiring else 0.0,
+        batch_size, batch_survival_rate, batch_unicorn_count,
+        batch_exit_count, batch_avg_team_size,
+        industry_company_count, industry_exit_rate,
+        fed_funds_rate, nasdaq_return, ai_hype,
+        # Interactions (7)
+        team_size * industry_exit_rate,         # team_x_industry_exit
+        team_size * batch_survival_rate,        # team_x_batch_survival
+        batch_survival_rate * years_since_batch, # batch_survival_x_maturity
+        industry_company_count * industry_exit_rate, # industry_density_x_exit_rate
+        tag_count * team_size,                  # tags_x_team
+        location_count * industry_exit_rate,    # location_x_industry_exit
+        batch_unicorn_count * years_since_batch, # unicorn_density_x_maturity
+        # Polynomials (3)
+        team_size ** 2,                         # team_size_sq
+        years_since_batch ** 2,                 # years_since_batch_sq
+        batch_survival_rate ** 2,               # batch_survival_sq
+        # Ratios (3)
+        team_size / batch_size if batch_size > 0 else 0.0,  # team_dominance_ratio
+        batch_unicorn_count / batch_size if batch_size > 0 else 0.0, # batch_unicorn_density
+        batch_exit_count / batch_size if batch_size > 0 else 0.0,    # batch_exit_density
+        # Binary flags (3)
+        1.0 if (team_size > 10 and industry_exit_rate > 0.1) else 0.0,  # large_team_hot_industry
+        1.0 if (team_size <= 5 and batch_survival_rate > 0.5) else 0.0, # small_team_strong_batch
+        1.0 if (tag_count > 3 and batch_size > 100) else 0.0,           # diverse_tags_large_batch
+    ]
+
+    return np.array(features, dtype=np.float32).reshape(1, -1)
 
 
 def predict_company(company_id: int, db: Optional[Database] = None) -> Dict[str, Any]:

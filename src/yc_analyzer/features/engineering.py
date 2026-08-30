@@ -204,6 +204,60 @@ class FeatureEngineer:
 
         return features
 
+    def _build_interaction_features(self, combined_df: pl.DataFrame) -> pl.DataFrame:
+        """Build feature interactions and polynomial features (P5.1)."""
+        logger.info("Building interaction features...")
+
+        features = combined_df.with_columns([
+            # --- Core interactions ---
+            # Team size × industry exit rate (big team in hot industry)
+            (pl.col("team_size").fill_null(0) * pl.col("industry_exit_rate").fill_null(0.0)).alias("team_x_industry_exit"),
+            # Team size × batch survival rate (big team in strong batch)
+            (pl.col("team_size").fill_null(0) * pl.col("batch_survival_rate").fill_null(0.0)).alias("team_x_batch_survival"),
+            # Batch survival × years since batch (strong batch, mature company)
+            (pl.col("batch_survival_rate").fill_null(0.0) * pl.col("years_since_batch").fill_null(0.0)).alias("batch_survival_x_maturity"),
+            # Industry company count × exit rate (crowded industry with exits)
+            (pl.col("industry_company_count").fill_null(0) * pl.col("industry_exit_rate").fill_null(0.0)).alias("industry_density_x_exit_rate"),
+            # Tag count × team size (diverse tags, big team)
+            (pl.col("tag_count").fill_null(0) * pl.col("team_size").fill_null(0)).alias("tags_x_team"),
+            # Location count × industry exit rate (multi-location, exit-prone industry)
+            (pl.col("location_count").fill_null(0) * pl.col("industry_exit_rate").fill_null(0.0)).alias("location_x_industry_exit"),
+            # Batch unicorn density × years since batch
+            (pl.col("batch_unicorn_count").fill_null(0) * pl.col("years_since_batch").fill_null(0.0)).alias("unicorn_density_x_maturity"),
+
+            # --- Polynomial features (top predictors) ---
+            # Team size squared
+            (pl.col("team_size").fill_null(0) ** 2).alias("team_size_sq"),
+            # Years since batch squared
+            (pl.col("years_since_batch").fill_null(0.0) ** 2).alias("years_since_batch_sq"),
+            # Batch survival rate squared
+            (pl.col("batch_survival_rate").fill_null(0.0) ** 2).alias("batch_survival_sq"),
+
+            # --- Ratio features ---
+            # Team size per batch company (team dominance)
+            pl.when(pl.col("batch_size").fill_null(0) > 0)
+            .then(pl.col("team_size").fill_null(0) / pl.col("batch_size").fill_null(0))
+            .otherwise(0.0).alias("team_dominance_ratio"),
+            # Unicorns per batch size (batch quality)
+            pl.when(pl.col("batch_size").fill_null(0) > 0)
+            .then(pl.col("batch_unicorn_count").fill_null(0) / pl.col("batch_size").fill_null(0))
+            .otherwise(0.0).alias("batch_unicorn_density"),
+            # Exits per batch size
+            pl.when(pl.col("batch_size").fill_null(0) > 0)
+            .then(pl.col("batch_exit_count").fill_null(0) / pl.col("batch_size").fill_null(0))
+            .otherwise(0.0).alias("batch_exit_density"),
+
+            # --- Binary interaction flags ---
+            # Large team + high industry exit
+            ((pl.col("team_size").fill_null(0) > 10) & (pl.col("industry_exit_rate").fill_null(0.0) > 0.1)).alias("large_team_hot_industry"),
+            # Small team + high batch survival
+            ((pl.col("team_size").fill_null(0) <= 5) & (pl.col("batch_survival_rate").fill_null(0.0) > 0.5)).alias("small_team_strong_batch"),
+            # High tag count + big batch
+            ((pl.col("tag_count").fill_null(0) > 3) & (pl.col("batch_size").fill_null(0) > 100)).alias("diverse_tags_large_batch"),
+        ])
+
+        return features
+
     def _combine_features(
         self,
         companies_df: pl.DataFrame,
@@ -221,6 +275,9 @@ class FeatureEngineer:
         # Join all feature sets
         for feat_df in [founder_features, company_features, batch_features, market_features]:
             result = result.join(feat_df, on="id", how="left")
+
+        # Add interaction features
+        result = self._build_interaction_features(result)
 
         return result
 

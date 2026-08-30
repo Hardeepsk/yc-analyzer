@@ -141,6 +141,23 @@ class Database:
             "is_hiring BOOLEAN DEFAULT FALSE",
             "team_size INTEGER DEFAULT 0",
             "status_raw VARCHAR",
+            # P5.1: Interaction features
+            "team_x_industry_exit DOUBLE DEFAULT 0.0",
+            "team_x_batch_survival DOUBLE DEFAULT 0.0",
+            "batch_survival_x_maturity DOUBLE DEFAULT 0.0",
+            "industry_density_x_exit_rate DOUBLE DEFAULT 0.0",
+            "tags_x_team INTEGER DEFAULT 0",
+            "location_x_industry_exit DOUBLE DEFAULT 0.0",
+            "unicorn_density_x_maturity DOUBLE DEFAULT 0.0",
+            "team_size_sq INTEGER DEFAULT 0",
+            "years_since_batch_sq DOUBLE DEFAULT 0.0",
+            "batch_survival_sq DOUBLE DEFAULT 0.0",
+            "team_dominance_ratio DOUBLE DEFAULT 0.0",
+            "batch_unicorn_density DOUBLE DEFAULT 0.0",
+            "batch_exit_density DOUBLE DEFAULT 0.0",
+            "large_team_hot_industry BOOLEAN DEFAULT FALSE",
+            "small_team_strong_batch BOOLEAN DEFAULT FALSE",
+            "diverse_tags_large_batch BOOLEAN DEFAULT FALSE",
         ]:
             col_name = col_def.split()[0]
             try:
