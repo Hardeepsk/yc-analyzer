@@ -124,7 +124,71 @@ def _get_features(company_id: int, db: Optional[Database] = None) -> Optional[np
         1.0 if (tag_count > 3 and batch_size > 100) else 0.0,           # diverse_tags_large_batch
     ]
 
+    # P5.4: Tag rarity features
+    tag_feats = _compute_single_tag_features(company_id, db)
+    features.extend(tag_feats)
+
     return np.array(features, dtype=np.float32).reshape(1, -1)
+
+
+def _compute_single_tag_features(company_id: int, db: Database) -> list:
+    """Compute tag IDF, uniqueness, and trending score for a single company (P5.4)."""
+    # Get company's tags
+    row = db.conn.execute("SELECT tags FROM companies WHERE id = ?", [company_id]).fetchone()
+    if not row or not row[0]:
+        return [0.0, 0.0, 1.0]
+
+    company_tag_list = list(set(row[0]))
+
+    # Get all tags for IDF computation
+    tag_rows = db.conn.execute("""
+        SELECT id, tags, batch FROM companies
+        WHERE tags IS NOT NULL AND len(tags) > 0
+    """).fetchall()
+
+    from collections import Counter
+    import re
+    tag_doc_freq = Counter()
+    recent_tags = Counter()
+    older_tags = Counter()
+
+    for cid, tag_list, batch in tag_rows:
+        if tag_list is None:
+            continue
+        unique_tags = list(set(tag_list))
+        for t in unique_tags:
+            tag_doc_freq[t] += 1
+        # Trending: split by batch year
+        if batch:
+            m = re.search(r"(\d{4})", batch)
+            if m:
+                year = int(m.group(1))
+                for t in unique_tags:
+                    if year >= 2023:
+                        recent_tags[t] += 1
+                    else:
+                        older_tags[t] += 1
+
+    n_companies = len(tag_rows)
+    tag_idf = {t: np.log(n_companies / max(freq, 1)) for t, freq in tag_doc_freq.items()}
+
+    # tag_trending
+    tag_trending = {}
+    all_tags = set(list(recent_tags.keys()) + list(older_tags.keys()))
+    for t in all_tags:
+        tag_trending[t] = recent_tags.get(t, 0) / max(older_tags.get(t, 1), 1)
+
+    # Compute features
+    idf_vals = [tag_idf.get(t, 0.0) for t in company_tag_list]
+    median_idf = np.median(list(tag_idf.values())) if tag_idf else 0.0
+    rare_count = sum(1 for v in idf_vals if v > median_idf)
+    trending_vals = [tag_trending.get(t, 1.0) for t in company_tag_list]
+
+    return [
+        float(np.mean(idf_vals)) if idf_vals else 0.0,     # tag_idf_score
+        rare_count / len(company_tag_list) if company_tag_list else 0.0,  # tag_uniqueness
+        float(np.mean(trending_vals)) if trending_vals else 1.0,         # tag_trending_score
+    ]
 
 
 def predict_company(company_id: int, db: Optional[Database] = None) -> Dict[str, Any]:

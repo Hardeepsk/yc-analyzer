@@ -43,11 +43,15 @@ FEATURE_COLS = [
     "team_dominance_ratio", "batch_unicorn_density", "batch_exit_density",
     # P5.1: Binary interaction flags
     "large_team_hot_industry", "small_team_strong_batch", "diverse_tags_large_batch",
+    # P5.4: Tag rarity features
+    "tag_idf_score", "tag_uniqueness", "tag_trending_score",
 ]
 
 
-def _prepare_xy(df: pl.DataFrame) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+def _prepare_xy(df: pl.DataFrame, db: Optional[Database] = None) -> Tuple[np.ndarray, np.ndarray, List[str]]:
     """Extract feature matrix X and label vector y, computing interactions from base features."""
+    db = db or get_db()
+
     # Base feature columns (stored in DB)
     BASE_COLS = [
         "years_since_batch", "team_size", "tag_count", "location_count",
@@ -96,12 +100,93 @@ def _prepare_xy(df: pl.DataFrame) -> Tuple[np.ndarray, np.ndarray, List[str]]:
         ((tags > 3) & (bsize > 100)).astype(float),      # diverse_tags_large_batch
     ])
 
-    X = np.hstack([base, interactions]).astype(np.float32)
+    # P5.4: Tag rarity features (computed from companies.tags)
+    tag_features = _compute_tag_features(df, db)
+    X = np.hstack([base, interactions, tag_features]).astype(np.float32)
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
     y = df.select("success_at_5yr").to_numpy().astype(np.float32).ravel()
 
     return X, y, FEATURE_COLS
+
+
+def _compute_tag_features(df: pl.DataFrame, db: Database) -> np.ndarray:
+    """Compute tag IDF, uniqueness, and trending score (P5.4)."""
+    logger.info("Computing tag features...")
+
+    # Get all tags with company IDs
+    tag_rows = db.conn.execute("""
+        SELECT id, tags FROM companies WHERE tags IS NOT NULL AND len(tags) > 0
+    """).fetchall()
+
+    if not tag_rows:
+        n = len(df)
+        return np.zeros((n, 3), dtype=np.float32)
+
+    # Build tag frequency map (IDF)
+    from collections import Counter
+    tag_doc_freq = Counter()
+    company_tags = {}
+    for cid, tag_list in tag_rows:
+        if tag_list is None:
+            continue
+        unique_tags = list(set(tag_list))  # deduplicate per company
+        company_tags[cid] = unique_tags
+        for t in unique_tags:
+            tag_doc_freq[t] += 1
+
+    n_companies = len(tag_rows)
+    # IDF = log(N / df(t)) — rare tags get higher weight
+    tag_idf = {t: np.log(n_companies / max(freq, 1)) for t, freq in tag_doc_freq.items()}
+
+    # Compute trending score: tags appearing more in recent batches (2023+)
+    recent_tags = Counter()
+    older_tags = Counter()
+    for cid, tag_list in company_tags.items():
+        # Look up batch year for this company
+        row = db.conn.execute("SELECT batch FROM companies WHERE id = ?", [cid]).fetchone()
+        if row and row[0]:
+            import re
+            m = re.search(r"(\d{4})", row[0])
+            if m:
+                year = int(m.group(1))
+                for t in tag_list:
+                    if year >= 2023:
+                        recent_tags[t] += 1
+                    else:
+                        older_tags[t] += 1
+
+    # Trending = recent_freq / max(older_freq, 1)
+    tag_trending = {}
+    all_tags = set(list(recent_tags.keys()) + list(older_tags.keys()))
+    for t in all_tags:
+        recent = recent_tags.get(t, 0)
+        older = older_tags.get(t, 1)
+        tag_trending[t] = recent / max(older, 1)
+
+    # Build feature vectors for each company in df
+    company_ids = df["id"].to_list() if "id" in df.columns else []
+    result = np.zeros((len(df), 3), dtype=np.float32)
+
+    for i, cid in enumerate(company_ids):
+        tag_list = company_tags.get(cid, [])
+        if not tag_list:
+            continue
+
+        # tag_idf_score: average IDF of company's tags
+        idf_vals = [tag_idf.get(t, 0.0) for t in tag_list]
+        result[i, 0] = np.mean(idf_vals) if idf_vals else 0.0
+
+        # tag_uniqueness: ratio of rare tags (IDF > median)
+        median_idf = np.median(list(tag_idf.values())) if tag_idf else 0.0
+        rare_count = sum(1 for v in idf_vals if v > median_idf)
+        result[i, 1] = rare_count / len(tag_list) if tag_list else 0.0
+
+        # tag_trending_score: average trending score of company's tags
+        trending_vals = [tag_trending.get(t, 1.0) for t in tag_list]
+        result[i, 2] = np.mean(trending_vals) if trending_vals else 1.0
+
+    return result
 
 
 def train_baseline(X_train: np.ndarray, y_train: np.ndarray) -> Any:
