@@ -330,6 +330,7 @@ class FeatureEngineer:
         company_features = self._build_company_features(companies_df)
         batch_features = self._build_batch_features(companies_df)
         market_features = self._build_market_features(companies_df)
+        funding_features = self._build_funding_features(companies_df)
 
         # Combine all features
         all_features = self._combine_features(
@@ -337,7 +338,8 @@ class FeatureEngineer:
             founder_features,
             company_features,
             batch_features,
-            market_features
+            market_features,
+            funding_features
         )
 
         # Store in database
@@ -532,6 +534,53 @@ class FeatureEngineer:
             "avg_team_size": "batch_avg_team_size",
         })
 
+    def _build_funding_features(self, companies_df: pl.DataFrame) -> pl.DataFrame:
+        """Build funding-related features from companies_enriched table."""
+        logger.info("Building funding features...")
+
+        query = """
+            SELECT company_id, has_funding_data, total_raised_usd, last_valuation_usd,
+                   round_count, funding_stage, years_since_last_round, investor_quality_score
+            FROM companies_enriched
+        """
+        funding_df = pl.from_arrow(self.db.conn.execute(query).arrow())
+
+        # Funding stage encoding
+        stage_map = {
+            "unknown": 0, "pre_seed": 1, "seed": 2, "series_a": 3, "series_b": 4,
+            "series_c": 5, "series_d": 6, "series_e": 7, "series_f": 8,
+            "ipo": 9, "acquired": 10, "debt": 1, "convertible": 1, "equity": 2,
+            "grant": 1, "angel": 1, "series_a1": 3, "series_a2": 3,
+            "series_b1": 4, "series_b2": 4, "series_c1": 5, "series_c2": 5,
+        }
+
+        # Join with companies
+        features = companies_df.select(["id"]).join(
+            funding_df, left_on="id", right_on="company_id", how="left"
+        ).with_columns([
+            pl.col("has_funding_data").fill_null(False).cast(pl.Boolean),
+            pl.col("total_raised_usd").fill_null(0.0),
+            pl.col("last_valuation_usd").fill_null(0.0),
+            pl.col("round_count").fill_null(0).cast(pl.Int32),
+            pl.col("funding_stage").fill_null("unknown"),
+            pl.col("years_since_last_round").fill_null(0.0),
+            pl.col("investor_quality_score").fill_null(0.0),
+        ]).with_columns([
+            # Encode funding_stage to numeric
+            pl.col("funding_stage").str.to_lowercase().replace(stage_map, default=0).alias("funding_stage_encoded"),
+        ]).select([
+            "id",
+            "has_funding_data",
+            "total_raised_usd",
+            "last_valuation_usd",
+            "round_count",
+            "funding_stage_encoded",
+            "years_since_last_round",
+            "investor_quality_score",
+        ])
+
+        return features
+
     def _build_market_features(self, companies_df: pl.DataFrame) -> pl.DataFrame:
         """Build market timing features."""
         logger.info("Building market features...")
@@ -627,6 +676,7 @@ class FeatureEngineer:
         company_features: pl.DataFrame,
         batch_features: pl.DataFrame,
         market_features: pl.DataFrame,
+        funding_features: pl.DataFrame,
     ) -> pl.DataFrame:
         """Combine all feature sets."""
         logger.info("Combining features...")
@@ -635,7 +685,7 @@ class FeatureEngineer:
         result = companies_df.select(["id"])
 
         # Join all feature sets
-        for feat_df in [founder_features, company_features, batch_features, market_features]:
+        for feat_df in [founder_features, company_features, batch_features, market_features, funding_features]:
             result = result.join(feat_df, on="id", how="left")
 
         # Add interaction features
@@ -665,6 +715,9 @@ class FeatureEngineer:
                         batch_exit_count = ?, batch_avg_team_size = ?, industry_company_count = ?,
                         industry_exit_rate = ?, fed_funds_rate_at_batch = ?,
                         nasdaq_return_1yr_post_batch = ?, ai_hype_index_at_batch = ?,
+                        has_funding_data = ?, total_raised_usd = ?, last_valuation_usd = ?,
+                        round_count = ?, funding_stage = ?, years_since_last_round = ?,
+                        investor_quality_score = ?,
                         enriched_at = CURRENT_TIMESTAMP
                     WHERE company_id = ?
                 """, [
@@ -677,6 +730,10 @@ class FeatureEngineer:
                     row.get("batch_avg_team_size", 0.0), row.get("industry_company_count", 0),
                     row.get("industry_exit_rate", 0.0), row.get("fed_funds_rate_at_batch", 0.0),
                     row.get("nasdaq_return_1yr_post_batch", 0.0), row.get("ai_hype_index_at_batch", 0.0),
+                    row.get("has_funding_data", False), row.get("total_raised_usd", 0.0),
+                    row.get("last_valuation_usd", 0.0), row.get("round_count", 0),
+                    row.get("funding_stage", "unknown"), row.get("years_since_last_round", 0.0),
+                    row.get("investor_quality_score", 0.0),
                     row["id"]
                 ])
             else:
@@ -689,8 +746,11 @@ class FeatureEngineer:
                         batch_size, batch_survival_rate, batch_unicorn_count,
                         batch_exit_count, batch_avg_team_size, industry_company_count,
                         industry_exit_rate, fed_funds_rate_at_batch,
-                        nasdaq_return_1yr_post_batch, ai_hype_index_at_batch
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        nasdaq_return_1yr_post_batch, ai_hype_index_at_batch,
+                        has_funding_data, total_raised_usd, last_valuation_usd,
+                        round_count, funding_stage, years_since_last_round,
+                        investor_quality_score
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, [
                     row["id"], row.get("founder_count", 0), row.get("has_technical_founder", False),
                     row.get("has_repeat_founder", False), row.get("founder_max_exits", 0),
@@ -700,7 +760,11 @@ class FeatureEngineer:
                     row.get("batch_unicorn_count", 0), row.get("batch_exit_count", 0),
                     row.get("batch_avg_team_size", 0.0), row.get("industry_company_count", 0),
                     row.get("industry_exit_rate", 0.0), row.get("fed_funds_rate_at_batch", 0.0),
-                    row.get("nasdaq_return_1yr_post_batch", 0.0), row.get("ai_hype_index_at_batch", 0.0)
+                    row.get("nasdaq_return_1yr_post_batch", 0.0), row.get("ai_hype_index_at_batch", 0.0),
+                    row.get("has_funding_data", False), row.get("total_raised_usd", 0.0),
+                    row.get("last_valuation_usd", 0.0), row.get("round_count", 0),
+                    row.get("funding_stage", "unknown"), row.get("years_since_last_round", 0.0),
+                    row.get("investor_quality_score", 0.0)
                 ])
 
         self.db.conn.commit()

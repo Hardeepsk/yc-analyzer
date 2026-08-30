@@ -190,6 +190,14 @@ class Database:
             # P8: Founder features scraped from the accelerator API
             "founder_linkedin_count INTEGER DEFAULT 0",
             "max_founder_bio_length INTEGER DEFAULT 0",
+            # P1.1: Funding features
+            "has_funding_data BOOLEAN DEFAULT FALSE",
+            "total_raised_usd DOUBLE DEFAULT 0.0",
+            "last_valuation_usd DOUBLE DEFAULT 0.0",
+            "round_count INTEGER DEFAULT 0",
+            "funding_stage VARCHAR DEFAULT 'unknown'",
+            "years_since_last_round DOUBLE DEFAULT 0.0",
+            "investor_quality_score DOUBLE DEFAULT 0.0",
         ]:
             col_name = col_def.split()[0]
             try:

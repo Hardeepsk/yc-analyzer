@@ -76,6 +76,9 @@ FEATURE_COLS = [
     "nlp_ind_0", "nlp_ind_1", "nlp_ind_2", "nlp_ind_3", "nlp_ind_4", "nlp_ind_5",
     "nlp_ind_6", "nlp_ind_7", "nlp_ind_8", "nlp_ind_9", "nlp_ind_10", "nlp_ind_11",
     "nlp_ind_12", "nlp_ind_13", "nlp_ind_14", "nlp_ind_15",
+    # P1.1: Funding features
+    "has_funding_data", "total_raised_usd", "last_valuation_usd",
+    "round_count", "funding_stage_encoded", "years_since_last_round", "investor_quality_score",
 ]
 
 # NLP feature column names (mirrors NLPEmbedder.column_names) for reuse in predict.py
@@ -98,6 +101,9 @@ def _prepare_xy(df: pl.DataFrame, db: Optional[Database] = None) -> Tuple[np.nda
         # P8: Founder features (scraped from the accelerator API)
         "founder_count", "has_technical_founder", "has_repeat_founder",
         "founder_linkedin_count", "max_founder_bio_length",
+        # P1.1: Funding features
+        "has_funding_data", "total_raised_usd", "last_valuation_usd",
+        "round_count", "funding_stage_encoded", "years_since_last_round", "investor_quality_score",
     ]
 
     # Select base columns that exist
