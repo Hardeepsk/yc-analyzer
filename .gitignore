@@ -1,0 +1,42 @@
+# Data
+data/yc_analyzer.duckdb
+data/yc_analyzer.duckdb.wal
+data/raw/
+data/processed/
+
+# Model artifacts
+models/*.json
+models/*.pkl
+models/*.txt
+models/*.md
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+
+# Logs
+*.log
