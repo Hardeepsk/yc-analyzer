@@ -10,7 +10,8 @@ from loguru import logger
 
 from yc_analyzer.config import settings
 from yc_analyzer.data.database import Database, get_db
-from yc_analyzer.models.train import FEATURE_COLS
+from yc_analyzer.models.train import FEATURE_COLS, NLP_FEATURE_COLS
+from yc_analyzer.features.engineering import NLPEmbedder
 
 
 _model_cache: Dict[str, Any] = {}
@@ -54,7 +55,7 @@ def _get_features(company_id: int, db: Optional[Database] = None) -> Optional[np
     """Get feature vector for a company, including computed interactions."""
     db = db or get_db()
 
-    # Get base features from DB
+    # Get base features from DB (must match FEATURE_COLS order in train.py)
     row = db.conn.execute("""
         SELECT
             ce.years_since_batch, ce.team_size, ce.tag_count, ce.location_count,
@@ -63,7 +64,9 @@ def _get_features(company_id: int, db: Optional[Database] = None) -> Optional[np
             ce.batch_exit_count, ce.batch_avg_team_size,
             ce.industry_company_count, ce.industry_exit_rate,
             ce.fed_funds_rate_at_batch, ce.nasdaq_return_1yr_post_batch,
-            ce.ai_hype_index_at_batch
+            ce.ai_hype_index_at_batch,
+            ce.founder_count, ce.has_technical_founder, ce.has_repeat_founder,
+            ce.founder_linkedin_count, ce.max_founder_bio_length
         FROM companies_enriched ce
         WHERE ce.company_id = ?
     """, [company_id]).fetchone()
@@ -71,13 +74,15 @@ def _get_features(company_id: int, db: Optional[Database] = None) -> Optional[np
     if row is None:
         return None
 
-    # Unpack base features
+    # Unpack base features (18) + founder features (5)
     (years_since_batch, team_size, tag_count, location_count,
      has_website, is_top_company, is_nonprofit, is_hiring,
      batch_size, batch_survival_rate, batch_unicorn_count,
      batch_exit_count, batch_avg_team_size,
      industry_company_count, industry_exit_rate,
-     fed_funds_rate, nasdaq_return, ai_hype) = row
+     fed_funds_rate, nasdaq_return, ai_hype,
+     founder_count, has_technical_founder, has_repeat_founder,
+     founder_linkedin_count, max_founder_bio_length) = row
 
     # Fill None values
     team_size = team_size or 0
@@ -91,8 +96,13 @@ def _get_features(company_id: int, db: Optional[Database] = None) -> Optional[np
     industry_company_count = industry_company_count or 0
     industry_exit_rate = industry_exit_rate or 0.0
     years_since_batch = years_since_batch or 0.0
+    founder_count = founder_count or 0
+    founder_linkedin_count = founder_linkedin_count or 0
+    max_founder_bio_length = max_founder_bio_length or 0
 
-    # Compute interaction features (P5.1)
+    # Compute interaction features (P5.1) — packed into a single 16-wide block
+    # that matches the order used in train.py's _prepare_xy (7 interactions +
+    # 3 polynomials + 3 ratios + 3 binary flags).
     features = [
         # Base (18)
         years_since_batch, team_size, tag_count, location_count,
@@ -102,6 +112,12 @@ def _get_features(company_id: int, db: Optional[Database] = None) -> Optional[np
         batch_exit_count, batch_avg_team_size,
         industry_company_count, industry_exit_rate,
         fed_funds_rate, nasdaq_return, ai_hype,
+        # Founder features (5) — must match FEATURE_COLS order
+        float(founder_count),
+        1.0 if has_technical_founder else 0.0,
+        1.0 if has_repeat_founder else 0.0,
+        float(founder_linkedin_count),
+        float(max_founder_bio_length),
         # Interactions (7)
         team_size * industry_exit_rate,         # team_x_industry_exit
         team_size * batch_survival_rate,        # team_x_batch_survival
@@ -136,7 +152,30 @@ def _get_features(company_id: int, db: Optional[Database] = None) -> Optional[np
     momentum_feats = _compute_single_momentum_features(company_id, db)
     features.extend(momentum_feats)
 
+    # P8: NLP embedding features (loaded fitted embedder)
+    nlp_feats = _compute_single_nlp_features(company_id, db)
+    features.extend(nlp_feats)
+
     return np.array(features, dtype=np.float32).reshape(1, -1)
+
+
+def _compute_single_nlp_features(company_id: int, db: Database) -> list:
+    """Compute NLP embedding features for a single company (P8).
+
+    Loads the fitted ``NLPEmbedder`` persisted during training and transforms the
+    company's text fields with the same PCA/vectorizer used at training time.
+    Returns a list of ``len(NLP_FEATURE_COLS)`` floats (zeros if no model is found).
+    """
+    embedder = NLPEmbedder.load()
+    if embedder is None:
+        logger.warning("No fitted NLP model found; returning zero NLP features")
+        return [0.0] * len(NLP_FEATURE_COLS)
+    try:
+        feats = embedder.transform([company_id], db)
+        return feats.astype(float).ravel().tolist()
+    except Exception as e:
+        logger.warning(f"NLP feature computation failed for company {company_id}: {e}")
+        return [0.0] * len(NLP_FEATURE_COLS)
 
 
 def _compute_single_geo_features(company_id: int, db: Database) -> list:
@@ -152,14 +191,20 @@ def _compute_single_geo_features(company_id: int, db: Database) -> list:
 
     primary_loc = locations[0] if isinstance(locations, list) else locations
 
-    # Get location stats
+    # Get location stats (use CTE form — DuckDB rejects UNNEST in SELECT+GROUP BY)
     stats = db.conn.execute("""
+        WITH unnested AS (
+            SELECT
+                UNNEST(all_locations) AS location,
+                top_company
+            FROM companies
+            WHERE all_locations IS NOT NULL AND len(all_locations) > 0
+        )
         SELECT
-            UNNEST(all_locations) AS location,
+            location,
             SUM(CASE WHEN top_company THEN 1 ELSE 0 END) AS unicorns,
             COUNT(*) AS total
-        FROM companies
-        WHERE all_locations IS NOT NULL AND len(all_locations) > 0
+        FROM unnested
         GROUP BY location
     """).fetchall()
 

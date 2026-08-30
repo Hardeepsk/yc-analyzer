@@ -62,20 +62,49 @@ class Database:
             )
         """)
 
-        # Founders table (normalized)
+        # Founders table (normalized) — one row per founder per company.
+        # `id` auto-increments via a sequence so callers can omit it on insert.
+        self.conn.execute("CREATE SEQUENCE IF NOT EXISTS founders_id_seq START 1")
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS founders (
-                id INTEGER PRIMARY KEY,
+                id INTEGER PRIMARY KEY DEFAULT NEXTVAL('founders_id_seq'),
                 company_id INTEGER NOT NULL REFERENCES companies(id),
-                name VARCHAR NOT NULL,
-                title VARCHAR,
+                founder_name VARCHAR NOT NULL,
+                founder_title VARCHAR,
+                founder_bio TEXT,
                 linkedin_url VARCHAR,
                 twitter_url VARCHAR,
-                bio TEXT,
                 avatar_url VARCHAR,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        # Migrate an older founders schema (name/title/bio columns) if present.
+        try:
+            fcols = [r[1] for r in self.conn.execute(
+                "SELECT * FROM pragma_table_info('founders')"
+            ).fetchall()]
+            rename_map = {
+                "name": "founder_name",
+                "title": "founder_title",
+                "bio": "founder_bio",
+            }
+            needs_migration = any(
+                old in fcols and new not in fcols for old, new in rename_map.items()
+            )
+            if needs_migration:
+                # The idx_founders_company index depends on the table and blocks
+                # ALTER; drop it, migrate, and let the later CREATE INDEX recreate it.
+                self.conn.execute("DROP INDEX IF EXISTS idx_founders_company")
+                for old, new in rename_map.items():
+                    if old in fcols and new not in fcols:
+                        self.conn.execute(f"ALTER TABLE founders RENAME COLUMN {old} TO {new}")
+                # Ensure id auto-increments for inserts that omit it.
+                self.conn.execute(
+                    "ALTER TABLE founders ALTER COLUMN id SET DEFAULT NEXTVAL('founders_id_seq')"
+                )
+        except Exception as e:  # pragma: no cover - best-effort migration
+            logger.warning(f"Founders schema migration skipped: {e}")
 
         # Enriched companies table (for ML features)
         self.conn.execute("""
@@ -158,6 +187,9 @@ class Database:
             "large_team_hot_industry BOOLEAN DEFAULT FALSE",
             "small_team_strong_batch BOOLEAN DEFAULT FALSE",
             "diverse_tags_large_batch BOOLEAN DEFAULT FALSE",
+            # P8: Founder features scraped from the accelerator API
+            "founder_linkedin_count INTEGER DEFAULT 0",
+            "max_founder_bio_length INTEGER DEFAULT 0",
         ]:
             col_name = col_def.split()[0]
             try:
@@ -221,3 +253,27 @@ class Database:
 def get_db() -> Database:
     """Get database instance."""
     return Database()
+
+
+def get_company_founders(company_id: int, db: Optional[Database] = None) -> list[dict]:
+    """Query founders for a given company.
+
+    Returns a list of dicts with keys: id, company_id, founder_name,
+    founder_title, founder_bio, linkedin_url, twitter_url, avatar_url, created_at.
+    """
+    db = db or get_db()
+    rows = db.conn.execute(
+        """
+        SELECT id, company_id, founder_name, founder_title, founder_bio,
+               linkedin_url, twitter_url, avatar_url, created_at
+        FROM founders
+        WHERE company_id = ?
+        ORDER BY id
+        """,
+        [company_id],
+    ).fetchall()
+    columns = [
+        "id", "company_id", "founder_name", "founder_title", "founder_bio",
+        "linkedin_url", "twitter_url", "avatar_url", "created_at",
+    ]
+    return [dict(zip(columns, row)) for row in rows]

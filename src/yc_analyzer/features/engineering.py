@@ -1,13 +1,314 @@
 """YC Analyzer - Feature engineering for ML models."""
 
+import pickle
+import warnings
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import numpy as np
 import polars as pl
 from loguru import logger
 from datetime import datetime
-from typing import Optional
-from pathlib import Path
 
 from yc_analyzer.config import settings, get_data_paths
 from yc_analyzer.data.database import Database, get_db
+
+
+# ---------------------------------------------------------------------------
+# NLP feature computation (embeddings + dimensionality reduction)
+# ---------------------------------------------------------------------------
+class NLPEmbedder:
+    """Compute dense NLP features from company text fields.
+
+    Per the spec we embed four text fields:
+      * long_description  -> "desc"  (fallback: name + industry + tags)
+      * short_description -> "short" (fallback: name + industry)
+      * concatenated tags -> "tags"
+      * concatenated industries -> "ind" (fallback: industry)
+
+    Each field is embedded to a dense vector and reduced to ``n_components``
+    via PCA, yielding ``len(FIELDS) * n_components`` total NLP features.
+
+    Backend:
+      * "minilm"  -> sentence-transformers all-MiniLM-L6-v2 (384-d) + PCA
+      * "tfidf"   -> TF-IDF (per field) + PCA  (automatic fallback when
+                     sentence-transformers is unavailable)
+
+    The fitted transformers are persisted to ``models/nlp_model.pkl`` and the
+    computed training embeddings are cached to ``models/nlp_embeddings.npz``.
+    """
+
+    FIELDS = ["desc", "short", "tags", "ind"]
+    N_COMPONENTS = 16
+    MODEL_NAME = "all-MiniLM-L6-v2"
+    CACHE_FILENAME = "nlp_embeddings.npz"
+    MODEL_FILENAME = "nlp_model.pkl"
+
+    def __init__(
+        self,
+        model_name: str = MODEL_NAME,
+        n_components: int = N_COMPONENTS,
+        backend: Optional[str] = None,
+    ):
+        self.model_name = model_name
+        self.n_components = n_components
+        self.backend = backend  # resolved at fit time if None
+        self.pcas: Dict[str, Optional[Any]] = {f: None for f in self.FIELDS}
+        self.vectorizers: Dict[str, Optional[Any]] = {f: None for f in self.FIELDS}
+        self._ncomp: Dict[str, int] = {f: 0 for f in self.FIELDS}
+        self._model = None
+        self._fitted = False
+        self.column_names = self._make_column_names()
+
+    # -- properties --------------------------------------------------------
+    @property
+    def n_features(self) -> int:
+        return len(self.FIELDS) * self.n_components
+
+    def _make_column_names(self) -> List[str]:
+        prefixes = {"desc": "nlp_desc", "short": "nlp_short", "tags": "nlp_tags", "ind": "nlp_ind"}
+        cols: List[str] = []
+        for f in self.FIELDS:
+            cols.extend(f"{prefixes[f]}_{i}" for i in range(self.n_components))
+        return cols
+
+    # -- backend resolution ------------------------------------------------
+    def _resolve_backend(self) -> str:
+        if self.backend in ("minilm", "tfidf"):
+            return self.backend
+        try:
+            import sentence_transformers  # noqa: F401
+            return "minilm"
+        except Exception:
+            logger.warning(
+                "sentence-transformers not available; falling back to TF-IDF + PCA "
+                "for NLP features (nlp_desc/short/tags/ind)."
+            )
+            return "tfidf"
+
+    def _get_model(self):
+        if self._model is None:
+            from sentence_transformers import SentenceTransformer
+            self._model = SentenceTransformer(self.model_name)
+        return self._model
+
+    # -- text extraction ---------------------------------------------------
+    def _fetch_records(self, ids: List[int], db: Database) -> Dict[int, dict]:
+        """Fetch raw text columns for the given company ids from the DB."""
+        if not ids:
+            return {}
+        cols = set(
+            r[1] for r in db.conn.execute("PRAGMA table_info(companies)").fetchall()
+        )
+        select = ["id", "name", "tags", "industry"]
+        for c in ("long_description", "short_description", "industries"):
+            if c in cols:
+                select.append(c)
+        placeholders = ",".join("?" for _ in ids)
+        q = f"SELECT {', '.join(select)} FROM companies WHERE id IN ({placeholders})"
+        rows = db.conn.execute(q, list(ids)).fetchall()
+        out: Dict[int, dict] = {}
+        for row in rows:
+            rec = dict(zip(select, row))
+            out[rec["id"]] = rec
+        return out
+
+    def _build_field_texts(self, records: List[dict]) -> Dict[str, List[str]]:
+        out = {f: [] for f in self.FIELDS}
+        for rec in records:
+            name = rec.get("name") or ""
+            tags = rec.get("tags") or []
+            if isinstance(tags, str):
+                tags = [tags]
+            industry = rec.get("industry") or ""
+            industries = rec.get("industries") or []
+            if isinstance(industries, str):
+                industries = [industries]
+            long_d = rec.get("long_description") or ""
+            short_d = rec.get("short_description") or ""
+
+            # long description (fallback to name + industry + tags)
+            if long_d and str(long_d).strip():
+                out["desc"].append(str(long_d))
+            else:
+                out["desc"].append(f"{name}. {industry}. " + " ".join(tags))
+
+            # short description (fallback to name + industry)
+            if short_d and str(short_d).strip():
+                out["short"].append(str(short_d))
+            else:
+                out["short"].append(f"{name}. {industry}.")
+
+            # tags
+            out["tags"].append(" ".join(tags) if tags else "")
+            # industries
+            out["ind"].append(" ".join(industries) if industries else industry)
+        return out
+
+    # -- raw embedding -----------------------------------------------------
+    def _raw_embed(self, field: str, texts: List[str]) -> np.ndarray:
+        if self.backend == "minilm":
+            model = self._get_model()
+            emb = model.encode(texts, show_progress_bar=False, convert_to_numpy=True)
+            return np.asarray(emb, dtype=np.float32)
+        # tfidf
+        vec = self.vectorizers[field]
+        if vec is None:
+            raise RuntimeError(f"TF-IDF vectorizer for field '{field}' not fitted")
+        mat = vec.transform(texts)
+        return np.asarray(mat.toarray(), dtype=np.float32)
+
+    # -- fit ---------------------------------------------------------------
+    def fit(self, ids: List[int], db: Database) -> "NLPEmbedder":
+        from sklearn.decomposition import PCA
+
+        if not ids:
+            logger.warning("NLPEmbedder.fit called with no ids; producing zero features")
+            self._fitted = True
+            return self
+
+        self.backend = self._resolve_backend()
+        records = [self._fetch_records(ids, db).get(i, {}) for i in ids]
+        field_texts = self._build_field_texts(records)
+
+        for f in self.FIELDS:
+            texts = field_texts[f]
+            if self.backend == "tfidf":
+                from sklearn.feature_extraction.text import TfidfVectorizer
+                vec = TfidfVectorizer(
+                    max_features=300, stop_words="english", ngram_range=(1, 2)
+                )
+                raw = vec.fit_transform(texts).toarray().astype(np.float32)
+                self.vectorizers[f] = vec
+            else:
+                raw = self._raw_embed(f, texts)
+
+            n_samples, n_feats = raw.shape
+            if n_feats == 0 or n_samples < 1:
+                self.pcas[f] = None
+                self._ncomp[f] = 0
+                continue
+            n_comp = min(self.n_components, n_feats, n_samples)
+            n_comp = max(1, n_comp)
+            pca = PCA(n_components=n_comp, random_state=settings.random_seed)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                pca.fit(raw)
+            self.pcas[f] = pca
+            self._ncomp[f] = pca.n_components_
+
+        self._fitted = True
+        logger.info(
+            f"NLPEmbedder fitted (backend={self.backend}) -> {self.n_features} NLP features"
+        )
+        return self
+
+    # -- transform ---------------------------------------------------------
+    def _transform_ids(self, ids: List[int], db: Database) -> np.ndarray:
+        if not ids:
+            return np.zeros((0, self.n_features), dtype=np.float32)
+        if not self._fitted:
+            raise RuntimeError("NLPEmbedder.transform called before fit()")
+
+        records = [self._fetch_records(ids, db).get(i, {}) for i in ids]
+        field_texts = self._build_field_texts(records)
+        cols = []
+        for f in self.FIELDS:
+            texts = field_texts[f]
+            pca = self.pcas[f]
+            if pca is None:
+                cols.append(np.zeros((len(ids), self.n_components), dtype=np.float32))
+                continue
+            raw = self._raw_embed(f, texts)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                reduced = pca.transform(raw).astype(np.float32)
+            # pad to fixed width
+            if reduced.shape[1] < self.n_components:
+                pad = np.zeros(
+                    (reduced.shape[0], self.n_components - reduced.shape[1]),
+                    dtype=np.float32,
+                )
+                reduced = np.hstack([reduced, pad])
+            cols.append(reduced)
+        return np.hstack(cols).astype(np.float32)
+
+    def transform(self, ids: List[int], db: Database) -> np.ndarray:
+        """Transform company ids to NLP feature matrix (n, n_features)."""
+        return self._transform_ids(ids, db)
+
+    # -- persistence -------------------------------------------------------
+    def save(self, model_dir: Optional[Path] = None) -> None:
+        model_dir = model_dir or settings.model_dir
+        model_dir.mkdir(parents=True, exist_ok=True)
+        # Don't persist the heavy sentence-transformers model object
+        self._model = None
+        with open(model_dir / self.MODEL_FILENAME, "wb") as fh:
+            pickle.dump(self, fh)
+        logger.info(f"Saved NLP model to {model_dir / self.MODEL_FILENAME}")
+
+    def save_embedding_cache(self, ids: List[int], embeddings: np.ndarray,
+                             model_dir: Optional[Path] = None) -> None:
+        model_dir = model_dir or settings.model_dir
+        model_dir.mkdir(parents=True, exist_ok=True)
+        path = model_dir / self.CACHE_FILENAME
+        np.savez(path, ids=np.array(ids, dtype=np.int64), embeddings=embeddings)
+        logger.info(f"Cached NLP embeddings ({embeddings.shape}) to {path}")
+
+    @classmethod
+    def load(cls, model_dir: Optional[Path] = None) -> Optional["NLPEmbedder"]:
+        model_dir = model_dir or settings.model_dir
+        path = model_dir / cls.MODEL_FILENAME
+        if not path.exists():
+            return None
+        try:
+            with open(path, "rb") as fh:
+                obj = pickle.load(fh)
+            obj._model = None
+            obj._fitted = True
+            logger.info(f"Loaded NLP model from {path} (backend={obj.backend})")
+            return obj
+        except Exception as e:
+            logger.warning(f"Could not load NLP model ({e}); will refit")
+            return None
+
+
+_NLP_EMBEDDER_CACHE: Optional[NLPEmbedder] = None
+
+
+def get_nlp_embedder(df: pl.DataFrame, db: Database, refit: bool = False) -> NLPEmbedder:
+    """Return a fitted NLPEmbedder, fitting + caching on first use.
+
+    Fits on the first dataframe passed (typically the training split) so the
+    same fitted PCA/vectorizer is reused for test and prediction data (no
+    leakage). Persists the fitted transformers to disk for prediction time.
+    """
+    global _NLP_EMBEDDER_CACHE
+    if _NLP_EMBEDDER_CACHE is not None and not refit:
+        return _NLP_EMBEDDER_CACHE
+
+    ids = _extract_ids(df)
+    emb = NLPEmbedder()
+    emb.fit(ids, db)
+    # Cache training embeddings to npz
+    try:
+        embeds = emb.transform(ids, db)
+        emb.save_embedding_cache(ids, embeds)
+    except Exception as e:
+        logger.warning(f"Could not cache NLP embeddings: {e}")
+    emb.save()
+    _NLP_EMBEDDER_CACHE = emb
+    return emb
+
+
+def _extract_ids(df: pl.DataFrame) -> List[int]:
+    """Extract company ids from a polars DataFrame (handles id / company_id)."""
+    if hasattr(df, "columns"):
+        if "company_id" in df.columns:
+            return [int(x) for x in df["company_id"].to_list()]
+        if "id" in df.columns:
+            return [int(x) for x in df["id"].to_list()]
+    return []
 
 
 class FeatureEngineer:
@@ -53,31 +354,92 @@ class FeatureEngineer:
         return pl.from_arrow(self.db.conn.execute(query).arrow())
 
     def _get_founders_df(self) -> pl.DataFrame:
-        """Load founders from database - returns empty DataFrame as founder data not available."""
-        return pl.DataFrame({
-            "company_id": [],
-            "name": [],
-            "title": [],
-            "linkedin_url": [],
-            "twitter_url": [],
-            "bio": [],
-            "avatar_url": [],
-        })
+        """Load founders from the database (scraped via the accelerator API)."""
+        query = """
+            SELECT company_id, founder_name, founder_title, founder_bio,
+                   linkedin_url, twitter_url, avatar_url
+            FROM founders
+        """
+        try:
+            df = pl.from_arrow(self.db.conn.execute(query).arrow())
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(f"Could not load founders: {e}")
+            df = pl.DataFrame({
+                "company_id": [],
+                "founder_name": [],
+                "founder_title": [],
+                "founder_bio": [],
+                "linkedin_url": [],
+                "twitter_url": [],
+                "avatar_url": [],
+            })
+        if df is None or df.height == 0:
+            return pl.DataFrame({
+                "company_id": [],
+                "founder_name": [],
+                "founder_title": [],
+                "founder_bio": [],
+                "linkedin_url": [],
+                "twitter_url": [],
+                "avatar_url": [],
+            })
+        return df
 
     def _build_founder_features(self, companies_df: pl.DataFrame, founders_df: pl.DataFrame) -> pl.DataFrame:
-        """Build founder-level features."""
+        """Build founder-level features from the founders table.
+
+        Features:
+        - founder_count: number of founders
+        - has_technical_founder: any founder title contains CTO/Engineer/Technical
+        - has_repeat_founder: any founder bio mentions "founded"/"co-founded"
+        - founder_linkedin_count: number of founders with a LinkedIn URL
+        - max_founder_bio_length: longest founder bio (chars)
+        """
         logger.info("Building founder features...")
 
-        # Founder data not available in current sources (YC OSS API and Cotera don't include founders)
-        # Would require scraping individual company pages or paid API (Crunchbase, PitchBook)
-        # Return placeholder features for now
-        return companies_df.select(["id"]).with_columns([
-            pl.lit(0).alias("founder_count"),
-            pl.lit(False).alias("has_technical_founder"),
-            pl.lit(False).alias("has_repeat_founder"),
-            pl.lit(0).alias("founder_max_exits"),
-            pl.lit(False).alias("founder_top_school"),
+        if founders_df.height == 0:
+            return companies_df.select(["id"]).with_columns([
+                pl.lit(0).alias("founder_count"),
+                pl.lit(False).alias("has_technical_founder"),
+                pl.lit(False).alias("has_repeat_founder"),
+                pl.lit(0).alias("founder_linkedin_count"),
+                pl.lit(0).alias("max_founder_bio_length"),
+            ])
+
+        tech_pattern = r"(?i)CTO|Engineer|Technical"
+        repeat_pattern = r"(?i)founded"
+
+        enriched = founders_df.with_columns([
+            pl.col("founder_title").fill_null("").alias("_title"),
+            pl.col("founder_bio").fill_null("").alias("_bio"),
+            pl.col("linkedin_url").is_not_null().alias("_has_linkedin"),
         ])
+
+        agg = enriched.group_by("company_id").agg([
+            pl.len().alias("founder_count"),
+            pl.col("_title").str.contains(tech_pattern).any().alias("has_technical_founder"),
+            pl.col("_bio").str.contains(repeat_pattern).any().alias("has_repeat_founder"),
+            pl.col("_has_linkedin").sum().cast(pl.Int32).alias("founder_linkedin_count"),
+            pl.col("_bio").str.len_chars().max().fill_null(0).cast(pl.Int32).alias("max_founder_bio_length"),
+        ])
+
+        features = (
+            companies_df.select(["id"])
+            .join(agg, left_on="id", right_on="company_id", how="left")
+            .with_columns([
+                pl.col("founder_count").fill_null(0).cast(pl.Int32),
+                pl.col("has_technical_founder").fill_null(False),
+                pl.col("has_repeat_founder").fill_null(False),
+                pl.col("founder_linkedin_count").fill_null(0).cast(pl.Int32),
+                pl.col("max_founder_bio_length").fill_null(0).cast(pl.Int32),
+            ])
+            .select([
+                "id", "founder_count", "has_technical_founder", "has_repeat_founder",
+                "founder_linkedin_count", "max_founder_bio_length",
+            ])
+        )
+
+        return features
 
     def _build_company_features(self, companies_df: pl.DataFrame) -> pl.DataFrame:
         """Build company-level features."""
@@ -297,7 +659,8 @@ class FeatureEngineer:
                 self.db.conn.execute("""
                     UPDATE companies_enriched SET
                         founder_count = ?, has_technical_founder = ?, has_repeat_founder = ?,
-                        founder_max_exits = ?, founder_top_school = ?, years_since_batch = ?,
+                        founder_max_exits = ?, founder_top_school = ?, founder_linkedin_count = ?,
+                        max_founder_bio_length = ?, years_since_batch = ?,
                         batch_size = ?, batch_survival_rate = ?, batch_unicorn_count = ?,
                         batch_exit_count = ?, batch_avg_team_size = ?, industry_company_count = ?,
                         industry_exit_rate = ?, fed_funds_rate_at_batch = ?,
@@ -307,7 +670,8 @@ class FeatureEngineer:
                 """, [
                     row.get("founder_count", 0), row.get("has_technical_founder", False),
                     row.get("has_repeat_founder", False), row.get("founder_max_exits", 0),
-                    row.get("founder_top_school", False), row.get("years_since_batch", 0.0),
+                    row.get("founder_top_school", False), row.get("founder_linkedin_count", 0),
+                    row.get("max_founder_bio_length", 0), row.get("years_since_batch", 0.0),
                     row.get("batch_size", 0), row.get("batch_survival_rate", 0.0),
                     row.get("batch_unicorn_count", 0), row.get("batch_exit_count", 0),
                     row.get("batch_avg_team_size", 0.0), row.get("industry_company_count", 0),
@@ -320,16 +684,18 @@ class FeatureEngineer:
                 self.db.conn.execute("""
                     INSERT INTO companies_enriched (
                         company_id, founder_count, has_technical_founder, has_repeat_founder,
-                        founder_max_exits, founder_top_school, years_since_batch,
+                        founder_max_exits, founder_top_school, founder_linkedin_count,
+                        max_founder_bio_length, years_since_batch,
                         batch_size, batch_survival_rate, batch_unicorn_count,
                         batch_exit_count, batch_avg_team_size, industry_company_count,
                         industry_exit_rate, fed_funds_rate_at_batch,
                         nasdaq_return_1yr_post_batch, ai_hype_index_at_batch
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, [
                     row["id"], row.get("founder_count", 0), row.get("has_technical_founder", False),
                     row.get("has_repeat_founder", False), row.get("founder_max_exits", 0),
-                    row.get("founder_top_school", False), row.get("years_since_batch", 0.0),
+                    row.get("founder_top_school", False), row.get("founder_linkedin_count", 0),
+                    row.get("max_founder_bio_length", 0), row.get("years_since_batch", 0.0),
                     row.get("batch_size", 0), row.get("batch_survival_rate", 0.0),
                     row.get("batch_unicorn_count", 0), row.get("batch_exit_count", 0),
                     row.get("batch_avg_team_size", 0.0), row.get("industry_company_count", 0),

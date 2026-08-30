@@ -208,11 +208,11 @@ class DataPipeline:
                     founders_data = [
                         {
                             "company_id": company.id,
-                            "name": f.name,
-                            "title": f.title,
+                            "founder_name": f.name,
+                            "founder_title": f.title,
                             "linkedin_url": str(f.linkedin_url) if f.linkedin_url else None,
                             "twitter_url": str(f.twitter_url) if f.twitter_url else None,
-                            "bio": f.bio,
+                            "founder_bio": f.bio,
                             "avatar_url": str(f.avatar_url) if f.avatar_url else None,
                         }
                         for f in company.founders
@@ -245,11 +245,11 @@ class DataPipeline:
                         self.db.conn.execute("DELETE FROM founders WHERE company_id = ?", [existing[0]])
                         if founders_data:
                             self.db.conn.executemany("""
-                                INSERT INTO founders (company_id, name, title, linkedin_url, twitter_url, bio, avatar_url)
+                                INSERT INTO founders (company_id, founder_name, founder_title, linkedin_url, twitter_url, founder_bio, avatar_url)
                                 VALUES (?, ?, ?, ?, ?, ?, ?)
                             """, [
-                                (f["company_id"], f["name"], f["title"], f["linkedin_url"],
-                                 f["twitter_url"], f["bio"], f["avatar_url"])
+                                (f["company_id"], f["founder_name"], f["founder_title"], f["linkedin_url"],
+                                 f["twitter_url"], f["founder_bio"], f["avatar_url"])
                                 for f in founders_data
                             ])
 
@@ -279,11 +279,11 @@ class DataPipeline:
                         # Insert founders
                         if founders_data:
                             self.db.conn.executemany("""
-                                INSERT INTO founders (company_id, name, title, linkedin_url, twitter_url, bio, avatar_url)
+                                INSERT INTO founders (company_id, founder_name, founder_title, linkedin_url, twitter_url, founder_bio, avatar_url)
                                 VALUES (?, ?, ?, ?, ?, ?, ?)
                             """, [
-                                (f["company_id"], f["name"], f["title"], f["linkedin_url"],
-                                 f["twitter_url"], f["bio"], f["avatar_url"])
+                                (f["company_id"], f["founder_name"], f["founder_title"], f["linkedin_url"],
+                                 f["twitter_url"], f["founder_bio"], f["avatar_url"])
                                 for f in founders_data
                             ])
 

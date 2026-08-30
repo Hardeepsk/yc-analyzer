@@ -2,18 +2,31 @@
 """YC Analyzer - Train ML models for success prediction."""
 
 import sys
+import argparse
 from pathlib import Path
 
 # Ensure src is on path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from yc_analyzer.models.labeling import compute_success_labels
-from yc_analyzer.models.train import run_training_pipeline
+from yc_analyzer.models.train import run_training_pipeline, run_tuning
 from yc_analyzer.models.predict import store_predictions, predict_batch
 from yc_analyzer.data.database import get_db
 
 
 def main():
+    parser = argparse.ArgumentParser(description="YC Analyzer - ML Training Pipeline")
+    parser.add_argument(
+        "--tune", action="store_true",
+        help="Run Optuna hyperparameter tuning for XGBoost/LightGBM (50 trials each) "
+             "and save best params to models/best_params.json before training",
+    )
+    parser.add_argument(
+        "--trials", type=int, default=50,
+        help="Number of Optuna trials per model when using --tune (default: 50)",
+    )
+    args = parser.parse_args()
+
     print("=" * 60)
     print("YC Analyzer - ML Training Pipeline")
     print("=" * 60)
@@ -24,6 +37,17 @@ def main():
     print("\n[1/4] Computing success labels...")
     updated = compute_success_labels(db)
     print(f"  Updated labels for {updated} companies")
+
+    # Optional: Hyperparameter tuning
+    if args.tune:
+        print(f"\n[1.5] Running Optuna hyperparameter tuning ({args.trials} trials each)...")
+        best_params = run_tuning(db, n_trials=args.trials)
+        print("\n  Best hyperparameters found:")
+        for model_name, mp in best_params.items():
+            print(f"  {model_name}:")
+            for k, v in mp.items():
+                print(f"    {k}: {v}")
+        print(f"  Saved to models/best_params.json")
 
     # Step 2: Train models
     print("\n[2/4] Training models...")

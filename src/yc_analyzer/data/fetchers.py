@@ -79,11 +79,11 @@ class YCOSSFetcher:
         founders = []
         for f in raw.get("founders", []):
             founders.append({
-                "name": f.get("name", ""),
-                "title": f.get("title"),
+                "founder_name": f.get("name", ""),
+                "founder_title": f.get("title"),
                 "linkedin_url": f.get("linkedin_url"),
                 "twitter_url": f.get("twitter_url"),
-                "bio": f.get("bio"),
+                "founder_bio": f.get("bio"),
                 "avatar_url": f.get("avatar_url"),
             })
 

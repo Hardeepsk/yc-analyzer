@@ -20,6 +20,7 @@ from sklearn.preprocessing import StandardScaler
 from yc_analyzer.config import settings
 from yc_analyzer.data.database import Database, get_db
 from yc_analyzer.models.labeling import get_labeled_training_data, get_holdout_data
+from yc_analyzer.features.engineering import NLPEmbedder, get_nlp_embedder
 
 
 # Feature columns used for training (numeric/boolean only)
@@ -32,6 +33,9 @@ FEATURE_COLS = [
     "industry_company_count", "industry_exit_rate",
     "fed_funds_rate_at_batch", "nasdaq_return_1yr_post_batch",
     "ai_hype_index_at_batch",
+    # P8: Founder features (scraped from the accelerator API)
+    "founder_count", "has_technical_founder", "has_repeat_founder",
+    "founder_linkedin_count", "max_founder_bio_length",
     # P5.1: Interaction features
     "team_x_industry_exit", "team_x_batch_survival",
     "batch_survival_x_maturity", "industry_density_x_exit_rate",
@@ -50,7 +54,25 @@ FEATURE_COLS = [
     # P5.5: Batch momentum features
     "batch_unicorn_growth", "batch_exit_growth", "batch_size_growth",
     "batch_survival_trend", "batch_momentum_score",
+    # P8: NLP embedding features (4 fields x 16 PCA components = 64)
+    # desc = long_description, short = short_description, tags = concatenated tags,
+    # ind = concatenated industries (see NLPEmbedder in features/engineering.py)
+    "nlp_desc_0", "nlp_desc_1", "nlp_desc_2", "nlp_desc_3", "nlp_desc_4", "nlp_desc_5",
+    "nlp_desc_6", "nlp_desc_7", "nlp_desc_8", "nlp_desc_9", "nlp_desc_10", "nlp_desc_11",
+    "nlp_desc_12", "nlp_desc_13", "nlp_desc_14", "nlp_desc_15",
+    "nlp_short_0", "nlp_short_1", "nlp_short_2", "nlp_short_3", "nlp_short_4", "nlp_short_5",
+    "nlp_short_6", "nlp_short_7", "nlp_short_8", "nlp_short_9", "nlp_short_10", "nlp_short_11",
+    "nlp_short_12", "nlp_short_13", "nlp_short_14", "nlp_short_15",
+    "nlp_tags_0", "nlp_tags_1", "nlp_tags_2", "nlp_tags_3", "nlp_tags_4", "nlp_tags_5",
+    "nlp_tags_6", "nlp_tags_7", "nlp_tags_8", "nlp_tags_9", "nlp_tags_10", "nlp_tags_11",
+    "nlp_tags_12", "nlp_tags_13", "nlp_tags_14", "nlp_tags_15",
+    "nlp_ind_0", "nlp_ind_1", "nlp_ind_2", "nlp_ind_3", "nlp_ind_4", "nlp_ind_5",
+    "nlp_ind_6", "nlp_ind_7", "nlp_ind_8", "nlp_ind_9", "nlp_ind_10", "nlp_ind_11",
+    "nlp_ind_12", "nlp_ind_13", "nlp_ind_14", "nlp_ind_15",
 ]
+
+# NLP feature column names (mirrors NLPEmbedder.column_names) for reuse in predict.py
+NLP_FEATURE_COLS = NLPEmbedder().column_names
 
 
 def _prepare_xy(df: pl.DataFrame, db: Optional[Database] = None) -> Tuple[np.ndarray, np.ndarray, List[str]]:
@@ -66,6 +88,9 @@ def _prepare_xy(df: pl.DataFrame, db: Optional[Database] = None) -> Tuple[np.nda
         "industry_company_count", "industry_exit_rate",
         "fed_funds_rate_at_batch", "nasdaq_return_1yr_post_batch",
         "ai_hype_index_at_batch",
+        # P8: Founder features (scraped from the accelerator API)
+        "founder_count", "has_technical_founder", "has_repeat_founder",
+        "founder_linkedin_count", "max_founder_bio_length",
     ]
 
     # Select base columns that exist
@@ -111,12 +136,50 @@ def _prepare_xy(df: pl.DataFrame, db: Optional[Database] = None) -> Tuple[np.nda
     geo_features = _compute_geo_features(df, db)
     # P5.5: Batch momentum features
     momentum_features = _compute_momentum_features(df, db)
-    X = np.hstack([base, interactions, tag_features, geo_features, momentum_features]).astype(np.float32)
+
+    # P8: NLP embedding features (sentence-transformers + PCA, or TF-IDF + PCA fallback)
+    nlp_features = _compute_nlp_features(df, db)
+
+    X = np.hstack([
+        base, interactions, tag_features, geo_features, momentum_features, nlp_features
+    ]).astype(np.float32)
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
     y = df.select("success_at_5yr").to_numpy().astype(np.float32).ravel()
 
     return X, y, FEATURE_COLS
+
+
+def _compute_nlp_features(df: pl.DataFrame, db: Database) -> np.ndarray:
+    """Compute NLP embedding features for the companies in ``df`` (P8).
+
+    Uses a fitted ``NLPEmbedder`` (fit on the first dataframe seen, typically the
+    training split, and cached in-process). Persists the fitted transformers and a
+    cached embedding matrix to ``models/`` for prediction time.
+    """
+    ids = _extract_ids_for_nlp(df)
+    if not ids:
+        logger.warning("No company ids found for NLP features; returning zeros")
+        return np.zeros((len(df), len(NLP_FEATURE_COLS)), dtype=np.float32)
+    try:
+        embedder = get_nlp_embedder(df, db)
+        feats = embedder.transform(ids, db)
+        if feats.shape[0] != len(df):
+            # Defensive: align by id order if shapes diverge
+            feats = np.zeros((len(df), len(NLP_FEATURE_COLS)), dtype=np.float32)
+        return feats.astype(np.float32)
+    except Exception as e:
+        logger.warning(f"NLP feature computation failed ({e}); using zeros")
+        return np.zeros((len(df), len(NLP_FEATURE_COLS)), dtype=np.float32)
+
+
+def _extract_ids_for_nlp(df: pl.DataFrame) -> List[int]:
+    """Extract company ids from a training/holdout DataFrame (id or company_id)."""
+    if "company_id" in df.columns:
+        return [int(x) for x in df["company_id"].to_list()]
+    if "id" in df.columns:
+        return [int(x) for x in df["id"].to_list()]
+    return []
 
 
 def _compute_tag_features(df: pl.DataFrame, db: Database) -> np.ndarray:
@@ -174,7 +237,7 @@ def _compute_tag_features(df: pl.DataFrame, db: Database) -> np.ndarray:
         tag_trending[t] = recent / max(older, 1)
 
     # Build feature vectors for each company in df
-    company_ids = df["id"].to_list() if "id" in df.columns else []
+    company_ids = df["company_id"].to_list() if "company_id" in df.columns else []
     result = np.zeros((len(df), 3), dtype=np.float32)
 
     for i, cid in enumerate(company_ids):
@@ -238,7 +301,7 @@ def _compute_geo_features(df: pl.DataFrame, db: Database) -> np.ndarray:
     hub_set = set(h for h, _ in top_hubs)
 
     # For each company, get primary location
-    company_ids = df["id"].to_list() if "id" in df.columns else []
+    company_ids = df["company_id"].to_list() if "company_id" in df.columns else []
     for i, cid in enumerate(company_ids):
         row = db.conn.execute(
             "SELECT all_locations FROM companies WHERE id = ?", [cid]
@@ -320,7 +383,7 @@ def _compute_momentum_features(df: pl.DataFrame, db: Database) -> np.ndarray:
             ) / 3.0
 
     # Map to companies
-    company_ids = df["id"].to_list() if "id" in df.columns else []
+    company_ids = df["company_id"].to_list() if "company_id" in df.columns else []
     company_batches = df["batch"].to_list() if "batch" in df.columns else []
 
     for i, (cid, batch) in enumerate(zip(company_ids, company_batches)):
@@ -353,8 +416,13 @@ def train_baseline(X_train: np.ndarray, y_train: np.ndarray) -> Any:
     return model, scaler
 
 
-def train_xgboost(X_train: np.ndarray, y_train: np.ndarray, sample_weights: Optional[np.ndarray] = None) -> Any:
-    """Train XGBoost classifier with optional cost-sensitive weighting."""
+def train_xgboost(X_train: np.ndarray, y_train: np.ndarray, sample_weights: Optional[np.ndarray] = None, model_params: Optional[Dict[str, Any]] = None) -> Any:
+    """Train XGBoost classifier with optional cost-sensitive weighting.
+
+    If ``model_params`` is provided (search-space naming from Optuna tuning), the
+    tuned hyperparameters are applied (max_depth, learning_rate, subsample,
+    colsample_bytree, reg_alpha, reg_lambda, min_child_weight, n_estimators).
+    """
     try:
         import xgboost as xgb
     except ImportError:
@@ -383,10 +451,19 @@ def train_xgboost(X_train: np.ndarray, y_train: np.ndarray, sample_weights: Opti
         "seed": settings.random_seed,
         "verbosity": 0,
     }
+    num_boost_round = 300
+    if model_params:
+        # Apply tuned hyperparameters (search-space naming)
+        for _key in ("max_depth", "learning_rate", "subsample", "colsample_bytree",
+                     "reg_alpha", "reg_lambda", "min_child_weight"):
+            if _key in model_params:
+                params[_key] = model_params[_key]
+        if "n_estimators" in model_params:
+            num_boost_round = int(model_params["n_estimators"])
 
     dtrain = xgb.DMatrix(X_train, label=y_train, weight=sample_weights)
     model = xgb.train(
-        params, dtrain, num_boost_round=300,
+        params, dtrain, num_boost_round=num_boost_round,
         verbose_eval=False,
     )
     return model
@@ -421,8 +498,12 @@ def _compute_focal_weights(X: np.ndarray, y: np.ndarray, gamma: float = 2.0) -> 
     return weights
 
 
-def train_lightgbm(X_train: np.ndarray, y_train: np.ndarray) -> Any:
-    """Train LightGBM classifier."""
+def train_lightgbm(X_train: np.ndarray, y_train: np.ndarray, model_params: Optional[Dict[str, Any]] = None) -> Any:
+    """Train LightGBM classifier.
+
+    If ``model_params`` is provided (search-space naming from Optuna tuning), the
+    tuned hyperparameters are translated to LightGBM param names and applied.
+    """
     try:
         import lightgbm as lgb
     except ImportError:
@@ -446,10 +527,237 @@ def train_lightgbm(X_train: np.ndarray, y_train: np.ndarray) -> Any:
         "seed": settings.random_seed,
         "verbose": -1,
     }
+    num_boost_round = 300
+    if model_params:
+        # Translate search-space names to LightGBM param names
+        _translation = {
+            "max_depth": "max_depth",
+            "learning_rate": "learning_rate",
+            "colsample_bytree": "feature_fraction",
+            "subsample": "bagging_fraction",
+            "min_child_weight": "min_child_weight",
+            "reg_alpha": "lambda_l1",
+            "reg_lambda": "lambda_l2",
+        }
+        for _src, _dst in _translation.items():
+            if _src in model_params:
+                params[_dst] = model_params[_src]
+        if model_params.get("subsample", 1.0) < 1.0:
+            params["bagging_freq"] = 1
+        if "n_estimators" in model_params:
+            num_boost_round = int(model_params["n_estimators"])
 
     dtrain = lgb.Dataset(X_train, label=y_train)
-    model = lgb.train(params, dtrain, num_boost_round=300)
+    model = lgb.train(params, dtrain, num_boost_round=num_boost_round)
     return model
+
+
+def optimize_xgboost(
+    db: Optional[Database] = None,
+    n_trials: int = 50,
+    n_splits: int = 3,
+    use_focal: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """Tune XGBoost hyperparameters with Optuna using temporal cross-validation.
+
+    Uses ``TimeSeriesSplit`` over the temporal training set (batches <= 2021, sorted
+    by batch year) to maximize AUC-ROC across folds. Focal weights (P7.2) are applied
+    per-fold when ``use_focal`` is True, matching the production ``train_xgboost``.
+
+    Returns the best hyperparameter dict (search-space naming) or None on failure.
+    """
+    try:
+        import optuna
+        import xgboost as xgb
+    except ImportError:
+        logger.warning("optuna or xgboost not installed, skipping XGBoost tuning")
+        return None
+
+    db = db or get_db()
+    logger.info("Loading training data for XGBoost tuning (temporal split, cutoff 2021)...")
+    train_df, _ = get_holdout_data(cutoff_year=2021, db=db)
+    if len(train_df) == 0:
+        logger.error("No training data available for tuning")
+        return None
+
+    # Sort temporally so TimeSeriesSplit respects time ordering
+    if "batch_year" in train_df.columns:
+        train_df = train_df.sort("batch_year")
+    X, y, _ = _prepare_xy(train_df, db)
+
+    def objective(trial: "optuna.Trial") -> float:
+        params = {
+            "objective": "binary:logistic",
+            "eval_metric": "auc",
+            "max_depth": trial.suggest_int("max_depth", 3, 10),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+            "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+            "reg_alpha": trial.suggest_float("reg_alpha", 0.0, 10.0),
+            "reg_lambda": trial.suggest_float("reg_lambda", 0.0, 10.0),
+            "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
+            "seed": settings.random_seed,
+            "verbosity": 0,
+        }
+        num_boost_round = int(trial.suggest_int("n_estimators", 100, 1000, step=50))
+
+        tscv = TimeSeriesSplit(n_splits=n_splits)
+        aucs: List[float] = []
+        for tr_idx, va_idx in tscv.split(X):
+            X_tr, X_va = X[tr_idx], X[va_idx]
+            y_tr, y_va = y[tr_idx], y[va_idx]
+            if len(np.unique(y_va)) < 2:
+                continue
+
+            n_neg = int((y_tr == 0).sum())
+            n_pos = int((y_tr == 1).sum())
+            p = dict(params)
+            p["scale_pos_weight"] = float(n_neg / max(n_pos, 1))
+
+            sw = _compute_focal_weights(X_tr, y_tr) if use_focal else None
+            dtrain = xgb.DMatrix(X_tr, label=y_tr, weight=sw)
+            dval = xgb.DMatrix(X_va)
+            model = xgb.train(
+                p, dtrain, num_boost_round=num_boost_round,
+                evals=[(dval, "val")], early_stopping_rounds=50, verbose_eval=False,
+            )
+            if getattr(model, "best_iteration", None) is not None:
+                prob = model.predict(dval, iteration_range=(0, model.best_iteration + 1))
+            else:
+                prob = model.predict(dval)
+            aucs.append(float(roc_auc_score(y_va, prob)))
+
+        return float(np.mean(aucs)) if aucs else 0.5
+
+    logger.info(f"Starting XGBoost Optuna study with {n_trials} trials...")
+    study = optuna.create_study(direction="maximize", study_name="xgboost_tuning")
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+
+    best = dict(study.best_params)
+    logger.info(f"XGBoost best CV AUC: {study.best_value:.4f}")
+    logger.info(f"XGBoost best params: {best}")
+    return best
+
+
+def optimize_lightgbm(
+    db: Optional[Database] = None,
+    n_trials: int = 50,
+    n_splits: int = 3,
+) -> Optional[Dict[str, Any]]:
+    """Tune LightGBM hyperparameters with Optuna using temporal cross-validation.
+
+    Mirrors ``optimize_xgboost`` but translates the search-space names to LightGBM
+    param names (subsample->bagging_fraction, colsample_bytree->feature_fraction,
+    reg_alpha->lambda_l1, reg_lambda->lambda_l2).
+
+    Returns the best hyperparameter dict (search-space naming) or None on failure.
+    """
+    try:
+        import optuna
+        import lightgbm as lgb
+    except ImportError:
+        logger.warning("optuna or lightgbm not installed, skipping LightGBM tuning")
+        return None
+
+    db = db or get_db()
+    logger.info("Loading training data for LightGBM tuning (temporal split, cutoff 2021)...")
+    train_df, _ = get_holdout_data(cutoff_year=2021, db=db)
+    if len(train_df) == 0:
+        logger.error("No training data available for tuning")
+        return None
+
+    if "batch_year" in train_df.columns:
+        train_df = train_df.sort("batch_year")
+    X, y, _ = _prepare_xy(train_df, db)
+
+    def objective(trial: "optuna.Trial") -> float:
+        search = {
+            "max_depth": trial.suggest_int("max_depth", 3, 10),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+            "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+            "reg_alpha": trial.suggest_float("reg_alpha", 0.0, 10.0),
+            "reg_lambda": trial.suggest_float("reg_lambda", 0.0, 10.0),
+            "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
+        }
+        num_boost_round = int(trial.suggest_int("n_estimators", 100, 1000, step=50))
+
+        lgb_params = {
+            "objective": "binary",
+            "metric": "auc",
+            "num_leaves": 31,
+            "learning_rate": search["learning_rate"],
+            "feature_fraction": search["colsample_bytree"],
+            "bagging_fraction": search["subsample"],
+            "min_child_weight": search["min_child_weight"],
+            "lambda_l1": search["reg_alpha"],
+            "lambda_l2": search["reg_lambda"],
+            "max_depth": search["max_depth"],
+            "seed": settings.random_seed,
+            "verbose": -1,
+        }
+        if search["subsample"] < 1.0:
+            lgb_params["bagging_freq"] = 1
+
+        tscv = TimeSeriesSplit(n_splits=n_splits)
+        aucs: List[float] = []
+        for tr_idx, va_idx in tscv.split(X):
+            X_tr, X_va = X[tr_idx], X[va_idx]
+            y_tr, y_va = y[tr_idx], y[va_idx]
+            if len(np.unique(y_va)) < 2:
+                continue
+
+            n_neg = int((y_tr == 0).sum())
+            n_pos = int((y_tr == 1).sum())
+            p = dict(lgb_params)
+            p["scale_pos_weight"] = n_neg / max(n_pos, 1)
+
+            dtrain = lgb.Dataset(X_tr, label=y_tr)
+            dval = lgb.Dataset(X_va, label=y_va)
+            model = lgb.train(
+                p, dtrain, num_boost_round=num_boost_round,
+                valid_sets=[dval],
+                callbacks=[lgb.early_stopping(50, verbose=False)],
+            )
+            it = model.best_iteration if getattr(model, "best_iteration", None) else num_boost_round
+            prob = model.predict(X_va, num_iteration=it)
+            aucs.append(float(roc_auc_score(y_va, prob)))
+
+        return float(np.mean(aucs)) if aucs else 0.5
+
+    logger.info(f"Starting LightGBM Optuna study with {n_trials} trials...")
+    study = optuna.create_study(direction="maximize", study_name="lightgbm_tuning")
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+
+    best = dict(study.best_params)
+    logger.info(f"LightGBM best CV AUC: {study.best_value:.4f}")
+    logger.info(f"LightGBM best params: {best}")
+    return best
+
+
+def run_tuning(db: Optional[Database] = None, n_trials: int = 50) -> Dict[str, Any]:
+    """Run Optuna tuning for both models and save best params to models/best_params.json.
+
+    Returns the dict of best params (keys: ``xgboost``, ``lightgbm``).
+    """
+    db = db or get_db()
+    settings.model_dir.mkdir(parents=True, exist_ok=True)
+
+    best_params: Dict[str, Any] = {}
+    xgb_best = optimize_xgboost(db, n_trials=n_trials)
+    if xgb_best is not None:
+        best_params["xgboost"] = xgb_best
+    lgb_best = optimize_lightgbm(db, n_trials=n_trials)
+    if lgb_best is not None:
+        best_params["lightgbm"] = lgb_best
+
+    if best_params:
+        path = settings.model_dir / "best_params.json"
+        with open(path, "w") as f:
+            json.dump(best_params, f, indent=2)
+        logger.info(f"Saved best params to {path}")
+
+    return best_params
 
 
 def evaluate_model(
@@ -554,6 +862,24 @@ def run_training_pipeline(db: Optional[Database] = None) -> Dict[str, Any]:
     model_dir = settings.model_dir
     model_dir.mkdir(parents=True, exist_ok=True)
 
+    # Load tuned best params (from Optuna) if available
+    best_params_path = model_dir / "best_params.json"
+    best_params: Dict[str, Any] = {}
+    if best_params_path.exists():
+        try:
+            with open(best_params_path) as f:
+                best_params = json.load(f)
+            logger.info(f"Loaded tuned best params from {best_params_path}")
+        except Exception as e:
+            logger.warning(f"Could not load best params ({e}); using defaults")
+            best_params = {}
+    xgb_params = best_params.get("xgboost")
+    lgb_params = best_params.get("lightgbm")
+    if xgb_params:
+        logger.info(f"Using tuned XGBoost params: {xgb_params}")
+    if lgb_params:
+        logger.info(f"Using tuned LightGBM params: {lgb_params}")
+
     # Load data
     train_df, test_df = get_holdout_data(cutoff_year=2021, db=db)
 
@@ -577,7 +903,7 @@ def run_training_pipeline(db: Optional[Database] = None) -> Dict[str, Any]:
     logger.info(f"LogisticRegression AUC: {lr_metrics.get('auc_roc', 'N/A')}")
 
     # XGBoost
-    xgb_model = train_xgboost(X_train, y_train)
+    xgb_model = train_xgboost(X_train, y_train, model_params=xgb_params)
     if xgb_model is not None:
         xgb_metrics = evaluate_model(xgb_model, None, X_test, y_test, "XGBoost", feature_names, xgb_model=True)
         all_metrics["xgboost"] = xgb_metrics
@@ -602,7 +928,7 @@ def run_training_pipeline(db: Optional[Database] = None) -> Dict[str, Any]:
             logger.info(f"P7.1: Dropped: {[n for n in feature_names if n not in selected_names]}")
 
             # Retrain XGBoost on selected features
-            xgb_selected = train_xgboost(selected_X_train, y_train)
+            xgb_selected = train_xgboost(selected_X_train, y_train, model_params=xgb_params)
             if xgb_selected is not None:
                 xgb_sel_metrics = evaluate_model(xgb_selected, None, selected_X_test, y_test, "XGBoost_Selected", selected_names, xgb_model=True)
                 all_metrics["xgboost_selected"] = xgb_sel_metrics
@@ -649,7 +975,15 @@ def run_training_pipeline(db: Optional[Database] = None) -> Dict[str, Any]:
                     "subsample": 0.8, "colsample_bytree": 0.8,
                     "scale_pos_weight": float(scale), "seed": 42, "verbosity": 0,
                 }
-                xgb_pseudo_model = xgb_lib.train(params, dtrain_aug, num_boost_round=300)
+                num_boost_round = 300
+                if xgb_params:
+                    for _key in ("max_depth", "learning_rate", "subsample", "colsample_bytree",
+                                 "reg_alpha", "reg_lambda", "min_child_weight"):
+                        if _key in xgb_params:
+                            params[_key] = xgb_params[_key]
+                    if "n_estimators" in xgb_params:
+                        num_boost_round = int(xgb_params["n_estimators"])
+                xgb_pseudo_model = xgb_lib.train(params, dtrain_aug, num_boost_round=num_boost_round)
                 pseudo_metrics = evaluate_model(xgb_pseudo_model, None, X_test, y_test, "XGBoost_Pseudo", feature_names, xgb_model=True)
                 all_metrics["xgboost_pseudo"] = pseudo_metrics
                 logger.info(f"XGBoost (pseudo-labeled) AUC: {pseudo_metrics.get('auc_roc', 'N/A')}")
@@ -666,7 +1000,7 @@ def run_training_pipeline(db: Optional[Database] = None) -> Dict[str, Any]:
                 logger.warning(f"P7.5: Pseudo-labeling failed: {e}")
 
     # LightGBM
-    lgb_model = train_lightgbm(X_train, y_train)
+    lgb_model = train_lightgbm(X_train, y_train, model_params=lgb_params)
     if lgb_model is not None:
         lgb_metrics = evaluate_model(lgb_model, None, X_test, y_test, "LightGBM", feature_names, xgb_model=True)
         all_metrics["lightgbm"] = lgb_metrics

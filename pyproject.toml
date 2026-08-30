@@ -37,6 +37,8 @@ ml = [
     "lifelines>=0.28",
     "shap>=0.43",
     "optuna>=3.4",
+    "sentence-transformers>=2.2",
+    "umap-learn>=0.5",
 ]
 api = [
     "fastapi>=0.104",
